@@ -266,10 +266,10 @@ virtual_partition_id =
 ### 6.1 VID 与 EID
 
 ```text
-63                    48 47                    16 15                 0
+63                    48 47                    32 32                 0
 +-----------------------+------------------------+--------------------+
-| virtual_partition_id  | local_sequence         | generation         |
-| 16 bit                | 32 bit                 | 16 bit             |
+| virtual_partition_id  | generation             | local_sequence     |
+| 16 bit                | 16 bit                 | 32 bit             |
 +-----------------------+------------------------+--------------------+
 ```
 
@@ -566,12 +566,12 @@ typedef struct st_graph_adj_slot {
 
 | 用户语法 | 编号 | 物理位置 | 用途 |
 |---|---|---|---|
-| `EDGE INLINE PROPERTIES` | 21 | 规范 Edge Slot | 属性事实来源和按 EID 点查 |
+| `EDGE INLINE PROPERTIES` | 21 | 规范 Edge Slot | 无损值或可验证派生投影，用于按 EID 点查 |
 | `OUT INLINE PROPERTIES` | 16 的出方向副本 | 出邻接项或出 Inline Edge | 正向遍历过滤 |
 | `IN INLINE PROPERTIES` | 16 的入方向副本 | 入邻接项或入 Inline Edge | 反向遍历过滤 |
 | 未声明 Inline | 25 | Edge Property Row | JSON、大对象、低频属性 |
 
-同一属性定义一次，通过三个存储子句声明副本位置。OUT 与 IN 可以不同，例如点击边的正向查询需要权重，反向查询只需要时间和状态。
+同一逻辑属性定义一次，通过三个存储子句声明物理投影位置。OUT 与 IN 可以不同，例如点击边的正向查询需要权重，反向查询只需要时间和状态。
 
 适合复制的属性是定长、高频过滤、低频更新、可压缩且选择性较高的属性。字符串、JSON、LOB、完整向量和高频计数进入属性行。
 
@@ -583,7 +583,7 @@ OUT INLINE 中存在：更新源顶点出邻接项
 IN INLINE 中存在：更新目标顶点入邻接项
 ```
 
-若属性只配置在 OUT 或 IN，而未配置 EDGE INLINE，其规范值存放在 `25`。
+若属性只配置在 OUT 或 IN，或者 Inline 值由任意表达式派生、使用 `HASH32_VERIFY`、或配置 `OVERFLOW=WARNING`，其规范原值必须存放在 `25`。只有可逆、无损且使用 `OVERFLOW=REJECT` 的直接属性转换，才允许由 `21` 单独承担规范值。
 
 ### 11.3 页面过滤
 
@@ -593,10 +593,121 @@ IN INLINE 中存在：更新目标顶点入邻接项
 - entry format 和 schema；
 - shard、计数、空闲空间、下一页；
 - 热属性最小值和最大值；
+- 每个 Inline 投影是否完整的 Page Bitmap 或失效计数；
 - 可选 Bloom Filter；
 - PCR ITL。
 
-查询可以先用页头范围跳过整页，再用邻接项属性过滤，最后只读取命中的规范边和顶点。
+查询可以先用页头范围跳过整页，再用邻接项属性过滤，最后只读取命中的规范边和顶点。如果谓词对应的投影在本页存在失效项，则 Zone Map 只能处理有效项，失效项必须进入原值回读队列，不能被当作“不匹配”跳过。
+
+### 11.4 时间 Inline 类型
+
+第一期不提供 `UINT32_DELTA`。只提供 `TIME32` 和 `TIME64`：
+
+```sql
+CAST(timestamp AS TIME32 WITH (
+    BASE = TIMESTAMP '2020-01-01 00:00:00+00:00',
+    UNIT = SECOND,
+    OVERFLOW = REJECT
+))
+```
+
+`TIME32` 保存相对显式 Base 的有符号 32-bit 时间差，`TIME64` 保存有符号 64-bit 时间差。`BASE` 和 `UNIT` 必填：
+
+- `BASE` 必须是带明确时区或已经规范化时区的时间字面量；
+- 禁止 `GRAPH_EPOCH`、`now()`、`current_time`、序列值、会话变量等动态来源；
+- `UNIT` 是 `SECOND`、`MILLISECOND`、`MICROSECOND` 等明确单位；
+- 编码公式是 `CAST(time_expression - base AS int32/int64)`；
+- Base 写入 Schema Layout，创建后不可变，修改 Base 创建新 Layout 版本。
+
+动态 Base 会使同一属性在不同写入时刻产生不同语义，并可能在更新后让已有 Inline 值失效，因此禁止使用。
+
+### 11.5 通用数值 Inline 表达式
+
+第一期不提供 `FIXED32_2`、`FIXED64_2`、`UINT8`、`UINT32_DELTA` 等业务语义 Codec。数值 Inline 统一使用扩展 CAST：
+
+```sql
+CAST(expression AS INLINE_INT32 WITH (
+    BASE = 0,
+    OVERFLOW = REJECT
+))
+```
+
+支持的目标类型包括：
+
+```text
+INLINE_INT8 / INLINE_UINT8
+INLINE_INT16 / INLINE_UINT16
+INLINE_INT32 / INLINE_UINT32
+INLINE_INT64 / INLINE_UINT64
+INLINE_FP32 / INLINE_FP64
+```
+
+`expression` 可以引用当前顶点或边的多个属性并使用现有确定性表达式。编码公式是：
+
+```text
+encoded = CAST(expression - base AS inline_numeric_type)
+```
+
+`BASE` 可省略，默认是目标类型的零值；指定时必须是不可变数值常量。转换、舍入、NaN 和无穷处理遵循现有 SQL CAST 规则，但超出目标类型范围时使用本节定义的 `OVERFLOW` 策略。
+
+允许任意表达式不代表优化器可以任意改写谓词。Inline 投影保存规范化表达式 AST。只有查询中出现相同规范化表达式，或者优化器能证明转换可逆且保持比较顺序时，才使用该 Inline 投影做过滤；否则回读规范原值。
+
+禁止在 Inline 表达式中使用：
+
+- `now()`、`current_time` 等时间相关函数；
+- 随机函数、序列和会话状态；
+- 子查询、聚合、窗口函数；
+- 外部表或其他顶点、边的属性；
+- 未标记为确定性的用户函数。
+
+### 11.6 Overflow 语义与失效值
+
+所有 `TIME32`、`TIME64` 和 `INLINE_*` 数值类型支持：
+
+```text
+OVERFLOW = REJECT | WARNING
+```
+
+默认是 `REJECT`。
+
+`REJECT` 表示转换溢出或失败时拒绝整条 SQL，事务不得留下部分 Vertex、Edge 或 Adjacency 修改。
+
+`WARNING` 表示规范原值写入成功，但对应 Inline 投影失效：
+
+1. 清除 Vertex/Edge 的 `hot_property_bitmap` 位，或清除 OUT/IN 项负载中的 Inline Valid Bitmap 位；
+2. 保留或写入 Property Row 中的规范原值；
+3. 返回 SQL Warning；
+4. 查询命中该项时批量回读规范原值，再执行原始谓词。
+
+OUT/IN Inline Valid Bitmap 属于 8B 或 16B 方向负载预算，不额外扩大 Entry。Page Header 维护属性级失效计数；只要某属性存在失效项，使用该属性的 Zone Map 就不能排除这些失效项。
+
+`WARNING` 保证 SQL 成功和结果正确，但可能降低查询性能。系统视图需要暴露每个 Inline 投影的失效率，超过阈值时建议修改 Base、目标类型或移除该投影。
+
+### 11.7 `HASH32_VERIFY`
+
+提供确定性函数：
+
+```sql
+HASH32_VERIFY(expression1, expression2, ...)
+```
+
+它将一个或多个表达式映射为 32-bit Hash，适合复合键等值预过滤。函数采用固定版本的持久化 Hash 算法和规范序列化：
+
+- 参数顺序参与 Hash；
+- 每个参数包含类型标签、NULL 标记和长度，禁止字符串简单拼接；
+- 字符串遵循声明的字符集和 Collation 规范化；
+- 时间统一到 Schema 声明的时区和精度；
+- Hash 算法版本记录在 Schema Layout 中，跨节点和升级保持一致。
+
+`HASH32_VERIFY` 永远不是规范值。Hash 命中后必须读取原始表达式涉及的属性并执行原谓词验证。它不能单独用于唯一约束、外键、排序或范围过滤。
+
+示例：
+
+```sql
+HASH32_VERIFY(tenant_id, campaign_id) AS tenant_campaign_hash
+```
+
+查询优化器只有在能保留并执行原始 `(tenant_id, campaign_id)` 等值条件时才能使用该 Hash。用户可见 SQL 类型是 `INTEGER`，物理上按 32 bit 原始位模式保存。
 
 ## 12. Inline Edge 的取舍
 
@@ -804,16 +915,26 @@ ID NAMESPACE User
 STORAGE (
     VERTEX_SLOT_SIZE = 64,
     INLINE PROPERTIES (
-        status           ENCODE UINT8,
-        region_id        ENCODE UINT16,
-        user_level       ENCODE UINT32,
-        last_active_time ENCODE INT64
+        CAST(status AS INLINE_INT8 WITH (
+            OVERFLOW = REJECT
+        )) AS status,
+        CAST(region_id AS INLINE_UINT16 WITH (
+            OVERFLOW = REJECT
+        )) AS region_id,
+        CAST(user_level AS INLINE_INT32 WITH (
+            OVERFLOW = REJECT
+        )) AS user_level,
+        CAST(last_active_time AS TIME64 WITH (
+            BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
+            UNIT = MICROSECOND,
+            OVERFLOW = REJECT
+        )) AS last_active_time
     )
 )
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 校验内嵌属性编码后不超过 16B，变长属性自动进入 `24`。
+DDL 校验内嵌属性编码后不超过 16B，变长属性自动进入 `24`。Vertex/Edge 的有效位使用 Meta 中已有的 `hot_property_bitmap`，不占用这 16B。
 
 可选低度边内嵌：
 
@@ -865,20 +986,46 @@ FROM User TO Advertisement (
 )
 STORAGE (
     EDGE INLINE PROPERTIES (
-        timestamp,
-        weight,
-        status,
-        device_type
+        CAST(timestamp AS TIME64 WITH (
+            BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
+            UNIT = MICROSECOND,
+            OVERFLOW = REJECT
+        )) AS timestamp,
+        CAST(weight AS INLINE_FP32 WITH (
+            OVERFLOW = REJECT
+        )) AS weight,
+        CAST(status AS INLINE_INT16 WITH (
+            OVERFLOW = REJECT
+        )) AS status,
+        CAST(device_type AS INLINE_INT16 WITH (
+            OVERFLOW = REJECT
+        )) AS device_type
     ),
     OUT INLINE PROPERTIES (
-        timestamp   ENCODE UINT32_DELTA,
-        weight      ENCODE FP16,
-        status      ENCODE UINT8,
-        device_type ENCODE UINT8
+        CAST(timestamp AS TIME32 WITH (
+            BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
+            UNIT = SECOND,
+            OVERFLOW = WARNING
+        )) AS timestamp,
+        CAST(weight AS INLINE_FP32 WITH (
+            OVERFLOW = REJECT
+        )) AS weight,
+        CAST(status AS INLINE_INT8 WITH (
+            OVERFLOW = REJECT
+        )) AS status,
+        CAST(device_type AS INLINE_INT8 WITH (
+            OVERFLOW = REJECT
+        )) AS device_type
     ),
     IN INLINE PROPERTIES (
-        timestamp ENCODE UINT32_DELTA,
-        status    ENCODE UINT8
+        CAST(timestamp AS TIME32 WITH (
+            BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
+            UNIT = SECOND,
+            OVERFLOW = WARNING
+        )) AS timestamp,
+        CAST(status AS INLINE_INT8 WITH (
+            OVERFLOW = REJECT
+        )) AS status
     ),
     OUT ADJACENCY (
         SORT BY timestamp DESC,
@@ -891,7 +1038,9 @@ STORAGE (
 );
 ```
 
-`detail` 未列入 Inline 子句，进入 `25`。编码宽度分别校验：EDGE INLINE 不超过 24B，OUT 与 IN 各自不超过所选的 8B 或 16B。
+`detail` 未列入 Inline 子句，进入 `25`。编码宽度分别校验：EDGE INLINE 不超过 24B，OUT 与 IN 各自不超过所选的 8B 或 16B，其中 OUT/IN 的 Inline Valid Bitmap 计入方向预算。
+
+例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出 2026 Base 的 TIME32 秒范围时，边写入仍成功，但邻接项对应有效位清零，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
 ### 17.5 超级节点策略
 
@@ -1100,7 +1249,11 @@ status_t graph_expand(graph_handle_t *handle,
 - 页面类型或布局版本不匹配；
 - 悬空 VID、EID 或 RowID；
 - 未指定重建模式就修改分区键；
-- OUT/IN 属性无法从规范值编码或校验。
+- OUT/IN 属性无法从规范值编码或校验；
+- TIME Base 不是明确时间字面量，或使用动态时间、会话状态；
+- Inline 表达式包含非确定性函数、子查询或跨对象引用；
+- `OVERFLOW=WARNING` 但不存在可回读的规范原值；
+- `HASH32_VERIFY` 无法保留和执行原始验证谓词。
 
 测试覆盖：
 
@@ -1113,6 +1266,12 @@ status_t graph_expand(graph_handle_t *handle,
 - 0/8/16B 方向属性预算；
 - DIRECT、PACKED、EXTERNAL 和超级节点策略；
 - 多 Label Set；
+- TIME32/TIME64 的边界、时区、单位和不可变 Base；
+- 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和 WARNING 有效位；
+- WARNING 失效项不能被 Zone Map 错误排除，并能批量回读规范值；
+- 任意确定性表达式的规范化匹配，以及非确定性表达式拒绝；
+- `HASH32_VERIFY` 的多列、NULL、类型、Collation、参数顺序和碰撞后原值验证；
+- Hash 算法版本在不同节点和恢复后的稳定性；
 - 跨页创建边的原子性；
 - 邻接属性过滤不读取未命中的 Edge Slot；
 - 同一查询 SCN 下的多跳可见性；
@@ -1131,6 +1290,9 @@ status_t graph_expand(graph_handle_t *handle,
 | 单 Label | Label Set | 支持一人多角色 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
 | 业务 ID 直接乘槽宽定位 | External ID 映射到 VID | 业务 ID 稀疏且需要稳定代次 |
+| `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | TIME32/TIME64 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
+| 动态时间 Base 或 Page Base | Schema 中的明确不可变时间字面量 | 更新和迁移不会改变 Inline 语义 |
+| Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 
 ## 25. 总体确认清单
 
@@ -1148,6 +1310,7 @@ status_t graph_expand(graph_handle_t *handle,
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
+13. 第一期时间编码只提供显式 Base 的 TIME32/TIME64；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
 
 以下参数保留为上线前基准测试项，不改变上述结构：
 
