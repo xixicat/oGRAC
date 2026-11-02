@@ -265,11 +265,12 @@ virtual_partition_id =
 
 ### 6.1 VID 与 EID
 
+VID 使用以下 64-bit 布局：
+
 ```text
-63                    48 47                    32 32                 0
 +-----------------------+------------------------+--------------------+
-| virtual_partition_id  | generation             | local_sequence     |
-| 16 bit                | 16 bit                 | 32 bit             |
+| virtual_partition_id  | local_sequence         | generation         |
+| 16 bit                | 32 bit                 | 16 bit             |
 +-----------------------+------------------------+--------------------+
 ```
 
@@ -286,6 +287,23 @@ virtual_partition_id =
 单分区 32 bit sequence 约支持 42.9 亿槽。百亿总体规模由多个 Virtual Partition 共同承载。
 
 边默认属于源顶点的 Virtual Partition，使出边记录与源顶点共置。
+
+EID 同样使用 64 bit，但中间 32 bit 是物理无关的 Edge Location：
+
+```text
++-----------------------+------------------------+----------+--------------------+
+| virtual_partition_id  | logical_page_no        | slot_id  | generation         |
+| 16 bit                | 24 bit                 | 8 bit    | 16 bit             |
++-----------------------+------------------------+----------+--------------------+
+```
+
+`logical_page_no` 定位 Virtual Partition 的 Edge Segment 中的逻辑页，`slot_id` 定位该页中的固定槽。8KB 页面中最小 Canonical Edge Slot 是 40B，单页不会超过 256 个槽，因此 8-bit `slot_id` 足够。
+
+24-bit `logical_page_no` 可表示 16,777,216 个 Edge Page，即每个 Virtual Partition 约 128GiB 的原始页面地址空间。扣除页头、PCR ITL 和分配 Bitmap 后，按 40B–64B Slot 估算，单个 Virtual Partition 可保存约 17 亿–31 亿条 Canonical Edge。百亿条边即使只使用 1,024 个 Virtual Partition，平均每分区也只有约 977 万条边，第一期余量充足。
+
+不从 generation 借位扩大页号。generation 用于阻止 Slot 复用后的陈旧 EID 命中新边，缩短为 8 bit 或 12 bit 会显著增加高频增删场景的回绕风险。Catalog 预留 `eid_layout_version`；若未来明确要求单个 Virtual Partition 超过上述容量，可以增加 `VP12_PAGE28_GEN16` 或更宽 EID，而不是静默改变现有编码。
+
+Edge Slot删除后再次分配时 generation递增；generation即将回绕时该Slot永久退休。第一期中，一个已经分配的 `logical_page_no` 永久绑定其Edge Type、Schema Layout、Slot宽度和逻辑页身份：即使所有Slot都已删除，也不能把该逻辑页号重新格式化为另一种Layout或映射到另一张新页。这样旧EID不会因为页面重格式化而按新的 `slot_size` 命中另一条边。系统在逻辑页号使用率达到75%时告警；回收该限制需要未来EID格式增加页面代次，不能复用当前Slot generation。
 
 ### 6.2 External ID
 
@@ -322,7 +340,7 @@ virtual_partition_id =
  │           ├─08 vertex_property_rowid ───────────────┐
  │           ├─09 OUT Adjacency Descriptor             │
  │           ├─10 IN Adjacency Descriptor              │
- │           └─11 Optional Inline Edge Area            │
+ │           └─11 Reserved Inline Edge Area (Phase 1=0)│
  │               ├─12 neighbor_vid ───────────────┐    │
  │               └─13 EID 或 edge_token ──────┐   │    │
  ├─14 Adjacency Directory                      │   │    │
@@ -358,17 +376,27 @@ PAGE_TYPE_GRAPH_ADJ_DATA
 
 ## 8. 顶点存储
 
-### 8.1 固定基础槽
+### 8.1 图级固定槽宽
 
-`05 Vertex Slot` 的基础部分固定为 64B：
+同一个图中的 `05 Vertex Slot` 宽度固定。创建图时从 0B、8B 和 16B 三档 Vertex Inline Property 预算中选择，默认 0B：
 
 | 编号 | 字段 | 大小 | 用途 |
 |---|---|---:|---|
 | 06 | `vertex_meta` | 16B | 状态、代次、Label Set、Schema、ITL、邻接模式 |
-| 07 | `inline_properties` | 16B | 定长热顶点属性 |
+| 07 | `inline_properties` | 0B、8B 或 16B | 定长热顶点属性 |
 | 08 | `property_rowid` | 8B | 指向 `24 Vertex Property Row` |
 | 09 | `out_adj` | 12B | 出邻接根位置和总出度 |
 | 10 | `in_adj` | 12B | 入邻接根位置和总入度 |
+
+三档布局分别为：
+
+| Graph Profile | Inline 预算 | Vertex Slot 总宽度 |
+|---|---:|---:|
+| `COMPACT` | 0B | 48B |
+| `INLINE_8` | 8B | 56B |
+| `INLINE_16` | 16B | 64B |
+
+0B 表示不保存 Inline Property 值，但 `vertex_meta`、两位状态位和 `property_rowid` 仍然存在。不同 Vertex Type 可以定义不同的 Inline 表达式，但编码总宽度不得超过图级预算；未使用的预算字节写零。图级固定槽宽使 VID 定位不依赖 Vertex Type 或 `schema_layout_id`。
 
 ```c
 typedef struct st_graph_vertex_meta {
@@ -386,7 +414,7 @@ typedef struct st_graph_vertex_meta {
 
 `flags` 表示已分配、已删除、存在属性行、出邻接溢出、入邻接溢出、超级节点、迁移中和冻结。删除标记受 MVCC 保护，旧快照结束后才允许回收。
 
-`label_set_id` 指向一组 Label。`schema_layout_id` 决定 16B 热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
+`label_set_id` 指向一组 Label。`schema_layout_id` 决定当前图级预算中的热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
 
 ```text
 00：NULL或属性不存在
@@ -420,7 +448,7 @@ fixed vertex slots
 page_tail_t
 ```
 
-`04` 中的槽宽固定，因此：
+`04` 中的槽宽在图级别固定，因此：
 
 ```text
 logical_page = local_sequence / slots_per_page
@@ -428,11 +456,13 @@ slot_id      = local_sequence % slots_per_page
 page_id      = extent_map[logical_page]
 ```
 
-`slots_per_page` 由页面大小、页头、ITL 和槽宽计算，并写入 Segment Header 与 Page Header。
+`slots_per_page` 由页面大小、页头、ITL 和图级槽宽计算，并写入 Graph Catalog、Segment Header 与 Page Header。Vertex Inline预算创建图后不可在线修改，因为改变槽宽会改变所有 `local_sequence` 对应的逻辑页和槽号；需要更大预算时必须重建图或执行未来提供的整图重写流程。
 
 ### 8.3 可选 Inline Edge
 
-`11` 默认不存在。启用后，出边数组和入边数组物理分离，因为 OUT 与 IN 的属性宽度可以不同：
+图级固定 Vertex Slot 后，不能再按 Vertex Type 追加不同大小的 `11 Optional Inline Edge Area`，否则同一图的槽宽将不再固定。因此第一期不在 Vertex Slot 中启用 Inline Edge，`inline_out_count`、`inline_in_count` 和编号 `11`–`13` 保留为零值与未来格式扩展点；低度边使用 Packed Small Adjacency Page。
+
+如果后续基准测试证明 Inline Edge 的收益足够大，只能在创建图时增加统一的 `VERTEX_INLINE_ADJACENCY_SIZE`，把固定的 OUT/IN 数组计入该图所有 Vertex Slot，而不能按 Vertex Type 改变槽宽。预留的元素格式为：
 
 ```c
 typedef struct st_graph_inline_edge_ref {
@@ -442,7 +472,7 @@ typedef struct st_graph_inline_edge_ref {
 } graph_inline_edge_ref_t;
 ```
 
-推荐容量是每个方向 0、1 或 2 条，最多评估到 4 条。8 条和 12 条不作为默认值，因为它们显著降低顶点页密度，并让每次增删边都修改顶点页。
+未来只评估每个方向 1 或 2 条，最多评估到4条。8条和12条不纳入设计，因为它们显著降低顶点页密度，并让每次增删边都修改顶点页。
 
 普通邻接页保存完整 EID。`edge_token` 只在混合多个 Edge Type 的顶点内嵌数组中使用，其布局为：
 
@@ -456,13 +486,28 @@ compact_type_code   16 bit
 
 ## 9. 规范边存储
 
-每条逻辑边有唯一的 `19 Canonical Edge Slot`，固定 64B：
+每条逻辑边有唯一的 `19 Canonical Edge Slot`。边不要求整个图使用同一种槽宽，而是保证单个 Edge Page 内的 Slot 固定。基础 Slot 为 40B，按 `EDGE INLINE PROPERTIES` 的编码预算扩展为 48B、56B 或 64B：
 
 | 编号 | 内容 | 大小 | 用途 |
 |---|---|---:|---|
 | 20 | `edge_meta + src_vid + dst_vid` | 32B | 类型、代次、Schema、ITL、端点 |
-| 21 | EDGE Inline Properties | 24B | 边属性的规范热值 |
+| 21 | EDGE Inline Properties | 0B–24B | 边属性的规范热值 |
 | 22 | `property_rowid` | 8B | 指向 `25 Edge Property Row` |
+
+计算公式为：
+
+```text
+slot_size = align8(40 + edge_inline_value_size)
+```
+
+| Edge Slot Profile | Inline Value 预算 | Slot 宽度 |
+|---|---:|---:|
+| `COMPACT` | 0B | 40B |
+| `INLINE_8` | 1B–8B | 48B |
+| `INLINE_16` | 9B–16B | 56B |
+| `INLINE_24` | 17B–24B | 64B |
+
+Edge Meta 中的 `inline_property_state_bitmap` 不占用上述 Inline Value 预算。默认 `EDGE_SLOT_PROFILE=AUTO`，系统选择容纳声明表达式的最小档位。用户也可以显式指定 Profile 为后续 Schema 预留空间；实际编码宽度超过显式预算时 DDL 失败，不允许任意字节宽度以避免产生过多页面类别。
 
 ```c
 typedef struct st_graph_edge_meta {
@@ -478,7 +523,25 @@ typedef struct st_graph_edge_meta {
 } graph_edge_meta_t;
 ```
 
-`17 Edge Page` 使用与顶点页相同的固定槽定位方式。EID 的 `local_sequence` 通过 `28 EID Locator` 得到逻辑页和槽号。
+`17 Edge Page` 统一使用 `PAGE_TYPE_GRAPH_EDGE`，不为 40B、48B、56B、64B 分别增加 Page Type。具体页面类别由以下字段共同确定：
+
+```text
+graph_id
++ PAGE_TYPE_GRAPH_EDGE
++ edge_type_id
++ schema_layout_id
++ page_layout_version
+```
+
+页面头持久化上述全部身份字段以及 `slot_size` 和 `slots_per_page`。同一页面中的所有Slot必须具有相同的Edge Type、Schema Layout和Slot宽度；页面清空后这些字段也不可改变。`edge_type_id` 虽然可以通过 `schema_layout_id` 查询，仍冗余保存在页头中，用于恢复、页面转储和损坏校验。
+
+每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Extent Map得到物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
+
+```text
+slot_address = slot_area + slot_id * slot_size
+```
+
+随后校验 Slot generation。这样不同Edge Type可以使用不同槽宽，同时保持EID直接定位。
 
 规范边是属性事实来源。出邻接和入邻接中的属性是为遍历准备的副本。
 
@@ -587,8 +650,8 @@ typedef struct st_graph_adj_slot {
 | 用户语法 | 编号 | 物理位置 | 用途 |
 |---|---|---|---|
 | `EDGE INLINE PROPERTIES` | 21 | 规范 Edge Slot | 无损值或可验证派生投影，用于按 EID 点查 |
-| `OUT INLINE PROPERTIES` | 16 的出方向副本 | 出邻接项或出 Inline Edge | 正向遍历过滤 |
-| `IN INLINE PROPERTIES` | 16 的入方向副本 | 入邻接项或入 Inline Edge | 反向遍历过滤 |
+| `OUT INLINE PROPERTIES` | 16 的出方向副本 | 出邻接项 | 正向遍历过滤 |
+| `IN INLINE PROPERTIES` | 16 的入方向副本 | 入邻接项 | 反向遍历过滤 |
 | 未声明 Inline | 25 | Edge Property Row | JSON、大对象、低频属性 |
 
 同一逻辑属性定义一次，通过三个存储子句声明物理投影位置。OUT 与 IN 可以不同，例如点击边的正向查询需要权重，反向查询只需要时间和状态。
@@ -735,29 +798,30 @@ HASH32_VERIFY(tenant_id, campaign_id) AS tenant_campaign_hash
 
 Inline Edge 能让低度拓扑查询在读到 `05` 后直接获得 `12 neighbor_vid`，减少一次邻接页访问。它不能高效支持复杂边属性过滤；一旦复制较多属性，顶点槽会迅速变大。
 
-100 亿顶点下，槽宽对空间影响显著：
+100 亿顶点下，图级槽宽对空间影响显著：
 
-| 基础布局 | 顶点槽 | 原始槽空间量级 |
+| 图级布局 | 顶点槽 | 原始槽空间量级 |
 |---|---:|---:|
-| 无 Inline Edge | 64B | 约 640GB |
-| 4 条 Compact | 128B | 约 1.28TB |
-| 8 条 Compact | 192B | 约 1.92TB |
+| `COMPACT` | 48B | 约 480GB |
+| `INLINE_8` | 56B | 约 560GB |
+| `INLINE_16` | 64B | 约 640GB |
 
 此数量未计入页头、ITL、空洞和副本。更大的槽还会降低顶点页缓存密度。
 
 因此默认值为：
 
 ```text
-Vertex Slot = 64B
+Vertex Inline Size = 0B
+Vertex Slot = 48B
 Inline Edge Capacity = 0
 低度邻接 = Packed Small Adjacency Page
 普通邻接 = 带 OUT/IN Inline Properties 的邻接页
 超级节点 = 分片邻接段
 ```
 
-只对 `BELONGS_TO`、`CREATED_BY` 等低度、低更新、过滤字段很少的边按 Vertex Type 启用 Inline Edge。热点顶点即使未达到容量，也提前进入邻接页，避免所有写操作争抢顶点页 X Owner。
+第一期包括 `BELONGS_TO`、`CREATED_BY` 在内的低度边也使用 Packed Small Adjacency Page。热点顶点提前进入普通邻接页，避免所有写操作争抢顶点页 X Owner。
 
-Inline Edge 没有独立 ITL，其变化记录在顶点槽版本和 Undo 中。同一顶点槽上的内嵌边更新会串行化。
+未来若启用 Inline Edge，它没有独立 ITL，其变化记录在顶点槽版本和Undo中；同一顶点槽上的内嵌边更新会串行化。这也是第一期选择Packed Small Adjacency Page的原因之一。
 
 ## 13. 属性页
 
@@ -821,7 +885,7 @@ Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 L
 (graph_id, label_id, virtual_partition_id) → compressed VID list
 ```
 
-添加或删除 Tag 时创建或复用新的 Label Set，事务内更新顶点槽和倒排索引。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变 64B 基础槽。
+添加或删除 Tag 时创建或复用新的 Label Set，事务内更新顶点槽和倒排索引。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
 
 ## 16. 复杂查询的遍历流程
 
@@ -884,8 +948,8 @@ candidate VID → 26/05 → 07 热属性 → 必要时 08/24
 ```text
 1. 从 A 的 Virtual Partition 分配 EID
 2. 写 19，保存 20、21、22
-3. 按 A 的模式写 11 或 16 的 OUT 项
-4. 按 B 的模式写 11 或 16 的 IN 项
+3. 按 A 的模式写 16 的 OUT 项
+4. 按 B 的模式写 16 的 IN 项
 5. 必要时创建或扩展 14、15
 6. 写 Undo/Redo
 7. 同一事务提交
@@ -905,11 +969,15 @@ OPTIONS (
     DEFAULT_CONSISTENCY = 'STATEMENT',
     PAGE_SIZE = '8K',
     VIRTUAL_PARTITIONS = 65536,
-    PLACEMENT_PARTITIONS = 1024
+    PLACEMENT_PARTITIONS = 1024,
+    VERTEX_INLINE_SIZE = 16,
+    EID_LAYOUT = 'VP16_PAGE24_SLOT8_GEN16'
 );
 ```
 
 `VIRTUAL_PARTITIONS` 是 VID 编码空间。物理 Segment 按实际出现的数据延迟创建。`PLACEMENT_PARTITIONS` 是当前迁移和调度粒度。
+
+`VERTEX_INLINE_SIZE` 只能是 0、8 或 16，省略时默认为 0，对应 48B、56B、64B Vertex Slot。该参数在图创建后不可在线修改。`EID_LAYOUT` 第一期只允许 `VP16_PAGE24_SLOT8_GEN16`；显式记录布局版本是为了后续增加更大单分区地址空间，而不是在现有格式中借用 generation。
 
 会话可覆盖一致性：
 
@@ -935,7 +1003,6 @@ CREATE VERTEX TYPE User IN GRAPH ad_graph (
 )
 ID NAMESPACE User
 STORAGE (
-    VERTEX_SLOT_SIZE = 64,
     INLINE PROPERTIES (
         CAST(status AS INLINE_INT8 WITH (
             OVERFLOW = REJECT
@@ -956,19 +1023,9 @@ STORAGE (
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 校验内嵌属性编码后不超过 16B，且 Inline 投影不超过 8 个；变长属性自动进入 `24`。Vertex/Edge 的两位状态使用 Meta 中已有的 `inline_property_state_bitmap`，不占用这 16B。
+DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。
 
-可选低度边内嵌：
-
-```sql
-VERTEX INLINE ADJACENCY (
-    EDGE TYPES (BELONGS_TO, CREATED_BY),
-    OUT CAPACITY 2,
-    IN CAPACITY 1,
-    OUT FORMAT 'INLINE_8',
-    IN FORMAT 'INLINE_8'
-);
-```
+第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边由Packed Small Adjacency Page承载。
 
 ### 17.3 Tag
 
@@ -1007,6 +1064,7 @@ FROM User TO Advertisement (
     detail      JSON
 )
 STORAGE (
+    EDGE_SLOT_PROFILE = AUTO,
     EDGE INLINE PROPERTIES (
         CAST(timestamp AS TIME64 WITH (
             BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
@@ -1060,7 +1118,7 @@ STORAGE (
 );
 ```
 
-`detail` 未列入 Inline 子句，进入 `25`。编码宽度分别校验：EDGE INLINE 不超过 24B且投影不超过8个；OUT 与 IN 各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
+`detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
 
 例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的TIME32秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
@@ -1128,7 +1186,9 @@ SWITCH    新布局成为默认写入格式
 GC        等待旧快照结束后回收
 ```
 
-槽宽变化必须创建新 Segment，再迁移 VID 对应的数据。
+Vertex Inline表达式只能在图级预算内变更，因此Vertex Slot宽度不变，可以在原Segment中按Layout版本双读和回填。超过图级预算的变更必须拒绝，用户需要重建图；第一期不提供改变 `VERTEX_INLINE_SIZE` 的在线迁移。
+
+Edge Inline表达式变更会创建新的 `schema_layout_id`。`EDGE_SLOT_PROFILE=AUTO` 对每个新Layout重新计算最小可用档位，因此新Layout可以比旧Layout更窄、同宽或更宽；显式Profile则继续使用用户指定的预算。新写入进入新Layout的Edge Page，旧边保留在旧Layout页面并继续按页头解码，不强制迁移且EID不变。更新旧边时，新Layout才有的值先写入Property Row；后台迁移Canonical Edge不属于第一期范围。
 
 ### 18.3 删除和类型变更
 
@@ -1217,6 +1277,10 @@ status_t graph_validate_edge_def(const graph_edge_def_t *def);
 graph_vid_t graph_make_vid(uint16 vpart, uint32 sequence, uint16 generation);
 status_t graph_vertex_locate(const graph_segment_layout_t *layout,
     graph_vid_t vid, graph_slot_location_t *location);
+graph_eid_t graph_make_eid(const graph_id_layout_t *id_layout,
+    uint16 vpart, uint32 logical_page_no, uint8 slot_id, uint16 generation);
+status_t graph_decode_eid(const graph_id_layout_t *id_layout,
+    graph_eid_t eid, graph_eid_fields_t *fields);
 status_t graph_edge_locate(const graph_segment_layout_t *layout,
     graph_eid_t eid, graph_slot_location_t *location);
 
@@ -1280,11 +1344,16 @@ status_t graph_expand(graph_handle_t *handle,
 测试覆盖：
 
 - VID/EID 边界值和往返；
+- 24-bit Edge逻辑页号、8-bit Slot和16-bit generation边界；
 - generation 不匹配；
 - 所有持久化结构的大小和偏移；
 - 8KB 页面容量；
 - sequence 到页和槽的定位；
-- 0/2/4 Inline Edge 配置；
+- 图级0/8/16B Vertex Inline预算及48/56/64B Slot定位；
+- 40/48/56/64B Edge Page的页内固定槽定位；
+- Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Page Layout Version和Slot宽度交叉校验；
+- Edge逻辑页清空后不允许更换Layout或映射新页，Slot generation回绕时退休；
+- Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
 - DIRECT、PACKED、EXTERNAL 和超级节点策略；
 - 多 Label Set；
@@ -1305,7 +1374,9 @@ status_t graph_expand(graph_handle_t *handle,
 | 早期想法 | 当前设计 | 原因 |
 |---|---|---|
 | VID 使用 16+40+8 | 16+32+16 | 为高频删除提供足够 generation |
-| 固定 128B 槽和 4–8 条内嵌边作为默认 | 默认 64B，内嵌边按类型启用 | 控制百亿顶点空间和顶点页争用 |
+| VID和EID使用相同的16+32+16解释 | VID为16+32+16；EID为16+24+8+16 | EID需要同时编码逻辑页与页内槽 |
+| 固定 128B 槽和 4–8 条内嵌边作为默认 | 图级Vertex Inline为0/8/16B，默认0B；第一期不在Vertex Slot中保存Inline Edge | 保证同一图槽宽固定，并控制百亿顶点空间和顶点页争用 |
+| 所有Canonical Edge固定64B | Page内固定，按Layout使用40/48/56/64B | 保持直接定位，同时提高无属性边和窄边的页面密度 |
 | 邻接项使用 edge_token | 普通邻接项使用完整 EID | 降低重建和恢复复杂度 |
 | 用户配置 Covering Properties | 用户配置 EDGE/OUT/IN INLINE | 直接表达三个物理副本 |
 | 每个顶点独立 Directory Page | DIRECT、PACKED、EXTERNAL 三级 | 低度顶点避免额外页面 |
@@ -1323,10 +1394,10 @@ status_t graph_expand(graph_handle_t *handle,
 确认本文表示同意以下基线：
 
 1. 原生图页面、复用 oGRAC 事务和 DRC。
-2. VID/EID 使用 16 bit 虚拟分区、32 bit 序号、16 bit 代次。
+2. VID使用16-bit虚拟分区、32-bit序号和16-bit代次；EID使用16-bit虚拟分区、24-bit逻辑页、8-bit页内槽和16-bit代次。
 3. 图虚拟分区、Placement、Preferred Instance、DRC 分区和 Page Owner 互不替代。
-4. 顶点基础槽 64B，Inline Edge 默认关闭并可按边类型启用。
-5. 每条边有唯一 64B 规范槽。
+4. 同一图的Vertex Slot固定；图创建时选择0B、8B或16B Inline预算，默认0B，对应48B、56B或64B Slot；第一期Inline Edge关闭，低度边使用Packed Small Adjacency Page。
+5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. 邻接目录按 Edge Type 路由，并根据数量选择 DIRECT、PACKED 或 EXTERNAL。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。
 8. 多 Label 使用 Label Set 和 ID Namespace。
