@@ -376,7 +376,7 @@ typedef struct st_graph_vertex_meta {
     uint16 generation;
     uint32 label_set_id;
     uint16 schema_layout_id;
-    uint16 hot_property_bitmap;
+    uint16 inline_property_state_bitmap;
     uint8  itl_id;
     uint8  inline_out_count;
     uint8  inline_in_count;
@@ -386,7 +386,16 @@ typedef struct st_graph_vertex_meta {
 
 `flags` 表示已分配、已删除、存在属性行、出邻接溢出、入邻接溢出、超级节点、迁移中和冻结。删除标记受 MVCC 保护，旧快照结束后才允许回收。
 
-`label_set_id` 指向一组 Label。`schema_layout_id` 决定 16B 热属性如何解码。`hot_property_bitmap` 表示哪些热属性存在。`itl_id` 指向 `03` 中的 PCR ITL。
+`label_set_id` 指向一组 Label。`schema_layout_id` 决定 16B 热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
+
+```text
+00：NULL或属性不存在
+01：Inline值有效
+10：Inline值失效，必须回读规范原值
+11：保留
+```
+
+16 bit 最多描述 8 个 Inline 投影。Schema Layout 为每个投影分配稳定的 ordinal 0–7；`bits[2*n, 2*n+1]` 对应 ordinal `n`。不在 Inline Layout 中的冷属性不占 ordinal。`itl_id` 指向 `03` 中的 PCR ITL。
 
 `adjacency_mode` 取值为：
 
@@ -461,7 +470,7 @@ typedef struct st_graph_edge_meta {
     uint16 generation;
     uint32 edge_type_id;
     uint16 schema_layout_id;
-    uint16 hot_property_bitmap;
+    uint16 inline_property_state_bitmap;
     uint8  itl_id;
     uint8  property_mode;
     uint8  validity_flags;
@@ -549,6 +558,17 @@ entry_size = 16B + direction_inline_size
 ```
 
 `direction_inline_size` 当前支持 0B、8B 和 16B。
+
+OUT/IN 属性负载使用相同的两位状态编码，但状态位包含在方向预算内：
+
+```c
+typedef struct st_graph_adj_inline_payload {
+    uint16 inline_property_state_bitmap;
+    uint8 encoded_values[direction_inline_size - sizeof(uint16)];
+} graph_adj_inline_payload_t;
+```
+
+因此 8B 负载实际提供 6B 编码值，16B 负载提供 14B 编码值，且每个方向最多定义 8 个 Inline 投影。Vertex/Edge Slot 的状态 Bitmap 位于 Meta 中，不占用各自 16B/24B Inline Value 区。
 
 邻接页的 4B Side Directory：
 
@@ -674,12 +694,14 @@ OVERFLOW = REJECT | WARNING
 
 `WARNING` 表示规范原值写入成功，但对应 Inline 投影失效：
 
-1. 清除 Vertex/Edge 的 `hot_property_bitmap` 位，或清除 OUT/IN 项负载中的 Inline Valid Bitmap 位；
+1. 将 Vertex/Edge Meta 或 OUT/IN 负载中对应投影的两位状态设置为 `10`；
 2. 保留或写入 Property Row 中的规范原值；
 3. 返回 SQL Warning；
 4. 查询命中该项时批量回读规范原值，再执行原始谓词。
 
-OUT/IN Inline Valid Bitmap 属于 8B 或 16B 方向负载预算，不额外扩大 Entry。Page Header 维护属性级失效计数；只要某属性存在失效项，使用该属性的 Zone Map 就不能排除这些失效项。
+状态 `00` 表示逻辑 NULL，不需要回读；状态 `01` 才允许直接解码 Inline 字节。状态 `10` 不能被当作 NULL 或“不匹配”。
+
+OUT/IN `inline_property_state_bitmap` 属于 8B 或 16B 方向负载预算，不额外扩大 Entry。Page Header 维护属性级失效计数；只要某属性存在状态 `10` 的项，使用该属性的 Zone Map 就不能排除这些项。
 
 `WARNING` 保证 SQL 成功和结果正确，但可能降低查询性能。系统视图需要暴露每个 Inline 投影的失效率，超过阈值时建议修改 Base、目标类型或移除该投影。
 
@@ -934,7 +956,7 @@ STORAGE (
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 校验内嵌属性编码后不超过 16B，变长属性自动进入 `24`。Vertex/Edge 的有效位使用 Meta 中已有的 `hot_property_bitmap`，不占用这 16B。
+DDL 校验内嵌属性编码后不超过 16B，且 Inline 投影不超过 8 个；变长属性自动进入 `24`。Vertex/Edge 的两位状态使用 Meta 中已有的 `inline_property_state_bitmap`，不占用这 16B。
 
 可选低度边内嵌：
 
@@ -1038,9 +1060,9 @@ STORAGE (
 );
 ```
 
-`detail` 未列入 Inline 子句，进入 `25`。编码宽度分别校验：EDGE INLINE 不超过 24B，OUT 与 IN 各自不超过所选的 8B 或 16B，其中 OUT/IN 的 Inline Valid Bitmap 计入方向预算。
+`detail` 未列入 Inline 子句，进入 `25`。编码宽度分别校验：EDGE INLINE 不超过 24B且投影不超过8个；OUT 与 IN 各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
 
-例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出 2026 Base 的 TIME32 秒范围时，边写入仍成功，但邻接项对应有效位清零，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
+例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的TIME32秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
 ### 17.5 超级节点策略
 
@@ -1267,8 +1289,9 @@ status_t graph_expand(graph_handle_t *handle,
 - DIRECT、PACKED、EXTERNAL 和超级节点策略；
 - 多 Label Set；
 - TIME32/TIME64 的边界、时区、单位和不可变 Base；
-- 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和 WARNING 有效位；
-- WARNING 失效项不能被 Zone Map 错误排除，并能批量回读规范值；
+- 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
+- `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
+- WARNING 状态 `10` 不能被 Zone Map 错误排除，并能批量回读规范值；
 - 任意确定性表达式的规范化匹配，以及非确定性表达式拒绝；
 - `HASH32_VERIFY` 的多列、NULL、类型、Collation、参数顺序和碰撞后原值验证；
 - Hash 算法版本在不同节点和恢复后的稳定性；
@@ -1293,6 +1316,7 @@ status_t graph_expand(graph_handle_t *handle,
 | `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | TIME32/TIME64 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
 | 动态时间 Base 或 Page Base | Schema 中的明确不可变时间字面量 | 更新和迁移不会改变 Inline 语义 |
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
+| 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
 
 ## 25. 总体确认清单
 
@@ -1311,6 +1335,7 @@ status_t graph_expand(graph_handle_t *handle,
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
 13. 第一期时间编码只提供显式 Base 的 TIME32/TIME64；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
+14. Vertex、Edge 和 OUT/IN Inline 投影使用两位状态编码，严格区分 NULL、有效值和规范原值回读。
 
 以下参数保留为上线前基准测试项，不改变上述结构：
 
