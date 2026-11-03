@@ -214,7 +214,8 @@ OpenCypher 前端
 ```text
 VID
  → Virtual Partition
- → Segment 与Radix Page Map
+ → Segment Extent Map
+ → 可选Sparse Exception Page Map
  → page_id
  → DRC Partition
  → Page Owner
@@ -303,7 +304,7 @@ EID 同样使用 64 bit，但中间 32 bit 是物理无关的 Edge Location：
 
 不从 generation 借位扩大页号。generation 用于阻止 Slot 复用后的陈旧 EID 命中新边，缩短为 8 bit 或 12 bit 会显著增加高频增删场景的回绕风险。Catalog 预留 `eid_layout_version`；若未来明确要求单个 Virtual Partition 超过上述容量，可以增加 `VP12_PAGE28_GEN16` 或更宽 EID，而不是静默改变现有编码。
 
-Edge Slot删除后再次分配时 generation递增；generation即将回绕时该Slot永久退休。第一期中，一个已经分配的 `logical_page_no` 永久绑定其Edge Type、Schema Layout、Slot宽度和逻辑页身份：即使所有Slot都已删除，也不能把该逻辑页号重新格式化或重新分配给另一种Layout。允许在保持全部Slot字节、generation、页面身份和Layout不变的前提下，把该逻辑页物理搬迁到新 `page_id`，并原子递增 `map_epoch`。这样旧EID不会因为页面重格式化而按新的 `slot_size` 命中另一条边。系统在逻辑页号使用率达到75%时告警；回收该限制需要未来EID格式增加页面代次，不能复用当前Slot generation。
+Edge Slot删除后再次分配时 generation递增；generation即将回绕时该Slot永久退休。第一期中，一个已经分配的 `logical_page_no` 永久绑定其Edge Type、Schema Layout、Slot宽度和逻辑页身份：即使所有Slot都已删除，也不能把该逻辑页号重新格式化或重新分配给另一种Layout。允许在保持全部Slot字节、generation、页面身份和Layout不变的前提下，通过Extent搬迁或Exception Entry把该逻辑页映射到新 `page_id`，并原子递增最终 `mapping_epoch`。这样旧EID不会因为页面重格式化而按新的 `slot_size` 命中另一条边。系统在逻辑页号使用率达到75%时告警；回收该限制需要未来EID格式增加页面代次，不能复用当前Slot generation。
 
 ### 6.2 External ID
 
@@ -373,7 +374,8 @@ Phase 1不在 `05` 中物理分配编号 `11`–`13`。它们只保留为未来�
 
 ```text
 PAGE_TYPE_GRAPH_SEG_HEAD
-PAGE_TYPE_GRAPH_SEG_MAP
+PAGE_TYPE_GRAPH_EXTENT_MAP
+PAGE_TYPE_GRAPH_EXCEPTION_MAP
 PAGE_TYPE_GRAPH_VERTEX
 PAGE_TYPE_GRAPH_EDGE
 PAGE_TYPE_GRAPH_ADJ_DIR
@@ -425,19 +427,19 @@ GRAPH_SEG_ADJ_DIRECTORY
 GRAPH_SEG_ADJ_DATA
 ```
 
-Map Root和Map内部Child都必须携带期望的Epoch与Generation，不能只保存Physical Page ID：
+Extent/Exception映射页的Root和Child都必须携带期望的Epoch与Generation，不能只保存Physical Page ID：
 
 ```c
-typedef struct st_graph_map_page_ref {
+typedef struct st_graph_mapping_page_ref {
     pagid_data_t physical_page_id;  /* 6B */
     uint16 flags;
-    uint32 map_epoch;
+    uint32 ref_epoch;
     uint16 page_generation;
     uint16 reserved_zero;
-} graph_map_page_ref_t;             /* 16B */
+} graph_mapping_page_ref_t;         /* 16B */
 ```
 
-Segment Head的Graph扩展部分为56B：
+每个Segment选择固定的Logical Extent大小，默认128页且必须是2的幂。Segment Head的Graph扩展部分为76B：
 
 ```c
 typedef struct st_graph_segment_head {
@@ -446,7 +448,8 @@ typedef struct st_graph_segment_head {
     uint16 virtual_partition_id;
     uint8  segment_kind;
     uint8  format_version;
-    graph_map_page_ref_t map_root;
+    graph_mapping_page_ref_t extent_map_root;
+    graph_mapping_page_ref_t exception_map_root;
     uint32 next_logical_page_no;
     uint32 allocated_page_count;
     uint32 retired_page_count;
@@ -455,67 +458,209 @@ typedef struct st_graph_segment_head {
     uint16 default_slots_per_page;
     uint16 fixed_itl_capacity;
     uint16 flags;
+    uint16 logical_extent_pages;     /* default 128 */
+    uint16 reserved_zero;
     uint32 free_layout_directory;
-} graph_segment_head_t;             /* 56B */
+} graph_segment_head_t;             /* 76B */
 ```
 
-逻辑页到物理页不使用巨大的平坦数组，而使用持久化Radix-256 Map。叶子项为16B：
+主路径使用Extent Map。每个20B Entry把一个Logical Extent映射到一个连续Physical Extent：
 
 ```c
-typedef struct st_graph_page_map_entry {
+typedef struct st_graph_extent_map_entry {
+    pagid_data_t physical_first_page; /* 6B */
+    uint16 page_count;
+    uint32 extent_epoch;
+    uint32 mapping_version;
+    uint16 allocation_generation;
+    uint16 flags;                   /* PRESENT/RETIRED/HAS_EXCEPTIONS */
+} graph_extent_map_entry_t;         /* 20B */
+```
+
+`allocation_generation` 在Physical Extent每次被空间分配器重新分配时递增，并与表空间分配记录及DRC Extent映射资源身份比较，用于阻止旧Extent映射ABA；它不能替代其中每个Logical Page的 `page_generation`。纯物理搬迁必须保留所有Logical Page的Page Generation。
+
+`PAGE_TYPE_GRAPH_EXTENT_MAP` 每张Leaf保存256个Extent Entry。普通Segment使用Chunked Extent Array；超过单层容量或Logical Extent空间稀疏时，`level>0` 页面使用256个Child Reference按Logical Extent Number组织：
+
+```c
+typedef struct st_graph_extent_map_header {
+    uint32 graph_id;
+    uint32 segment_id;
+    uint32 base_logical_extent_no;
+    uint16 virtual_partition_id;
+    uint8  segment_kind;
+    uint8  level;                   /* 0=256个Extent Entry */
+    uint16 entry_count;
+    uint16 flags;
+    uint32 chunk_epoch;
+} graph_extent_map_header_t;        /* 24B */
+
+typedef graph_mapping_page_ref_t graph_extent_map_child_t; /* 16B */
+```
+
+Extent Map每层固定Fanout 256。Level 0覆盖256个Logical Extent，Level L覆盖 `256^(L+1)` 个Logical Extent；覆盖范围和Base对齐使用64-bit Checked Arithmetic，避免32-bit Root计算溢出。`base_logical_extent_no` 必须按本层覆盖范围对齐，分支下标按Logical Extent Number对应层的8-bit数字计算。
+
+正常页面定位：
+
+```text
+logical_extent_no = logical_page_no / logical_extent_pages
+page_offset       = logical_page_no % logical_extent_pages
+extent_entry      = lookup_extent(logical_extent_no)
+physical_page_id  = extent_entry.physical_first_page + page_offset
+```
+
+只有Extent Entry设置 `HAS_EXCEPTIONS` 时才查询单页Exception Map。异常项为20B：
+
+```c
+typedef struct st_graph_page_exception {
+    uint32 logical_page_no;
     pagid_data_t physical_page_id;  /* 6B */
-    uint16 flags;                   /* PRESENT/RETIRED/MOVING */
-    uint32 map_epoch;
+    uint16 flags;
+    uint32 exception_epoch;
     uint16 page_generation;
     uint16 layout_id;
-} graph_page_map_entry_t;           /* 16B */
+} graph_page_exception_t;           /* 20B */
 ```
 
-`PAGE_TYPE_GRAPH_SEG_MAP` 的Map扩展头和内部Child Entry为：
+Exception Flags固定为 `PRESENT/RETIRED`。Bitmap命中后只有 `PRESENT=1 && RETIRED=0` 的Entry可用，并必须校验完整Logical Page、Layout、Exception Epoch和Page Generation。`MOVING` 是Mapping X Guard的易失运行态，不写入持久化Entry，避免Crash留下永久阻塞状态。
+
+Exception Map使用按需分配的Radix-256容器，但不预分配256个完整Entry。Internal Node的Bitmap表示存在的Child；Leaf的Bitmap表示存在异常的Logical Page，后面只紧凑保存置位项：
 
 ```c
-typedef struct st_graph_page_map_header {
+typedef struct st_graph_exception_map_header {
     uint32 graph_id;
     uint32 segment_id;
     uint32 base_logical_page_no;
     uint16 virtual_partition_id;
     uint8  segment_kind;
-    uint8  level;                    /* 0=leaf */
+    uint8  level;                   /* 0=leaf */
     uint16 entry_count;
     uint16 flags;
-    uint32 reserved_zero;
-} graph_page_map_header_t;           /* 24B */
+    uint32 node_epoch;
+    uint8  presence_bitmap[32];     /* 256 bit */
+} graph_exception_map_header_t;     /* 56B */
 
-typedef graph_map_page_ref_t graph_page_map_child_t; /* 16B */
+typedef graph_mapping_page_ref_t graph_exception_map_child_t; /* 16B */
 ```
 
-每层固定Fanout 256。内部页保存256个Child Entry，Leaf保存256个 `graph_page_map_entry_t`；`base_logical_page_no` 必须按当前层覆盖范围对齐。Map Page使用 `page_head_t + graph_page_identity_t + graph_page_map_header_t + entries + page_tail_t`，通过 `map_root` 和Child Physical Page ID访问，不再递归映射。每次读取都校验Reference中的 `map_epoch/page_generation`；物理搬迁Map Page时原子更新父Reference，旧物理页只有在旧引用不再可见后才能复用。
+Exception Radix的Level 0 Leaf覆盖256个Logical Page，Base必须按256页对齐；上层覆盖范围依次乘256。分支下标为Logical Page Number对应层的8-bit数字。Compact Child或Exception Entry按Bitmap位序紧凑排列：
 
-Segment Head与Map Page的公共身份规则为：
+```text
+rank = popcount(presence_bitmap & bits_below(branch_index))
+```
+
+必须满足 `entry_count == popcount(presence_bitmap)`，Leaf命中后还要验证Entry中的完整 `logical_page_no`。24-bit Edge Logical Page最多3层，32-bit Vertex/Adjacency最多4层。
+
+没有异常时 `exception_map_root` 无效，常规查询完全不进入Radix。存在异常的Extent应缓存命中与未命中结果，正负缓存项都必须带 `mapping_version`。当异常页达到16页或Extent的12.5%时，后台重写整个Extent、合并Exception并清除 `HAS_EXCEPTIONS`，具体阈值由基准测试调整。
+
+最终解析顺序固定为：
+
+```text
+1. 获取Logical Extent的Mapping Read Guard
+2. 根据logical_extent_no读取Extent Entry并校验：
+      PRESENT=1，RETIRED=0
+      page_offset < page_count <= logical_extent_pages
+3. Entry没有HAS_EXCEPTIONS：
+      physical_first_page + page_offset
+4. Entry有HAS_EXCEPTIONS：
+      查询Exception Cache/Map
+      命中   → Exception physical_page_id
+      未命中 → Extent默认物理页
+5. 使用Checked Page-ID Addition，Physical Extent不得跨Datafile边界
+6. 将physical page_id交给DRC定位Page Owner并Pin Buffer
+7. 校验Page Identity.mapping_epoch匹配最终Extent/Exception Epoch
+   并复读Guard保护下的Extent Entry.mapping_version
+8. 释放Mapping Read Guard；Buffer Pin继续保护物理页
+```
+
+如果步骤7发现 `mapping_version` 不匹配，必须Unpin已进入的Buffer、丢弃对应翻译缓存、释放Guard并从步骤1重新解析；禁止返回旧Resolution。
+
+Extent Cache Key是 `(graph_id, vpart, segment_kind, logical_extent_no)`；Exception Cache Key再增加 `logical_page_no`，并缓存未命中。正负Exception缓存都必须匹配当前 `mapping_version`。普通热路径只执行一次Extent Cache查询和页内偏移加法。
+
+每个Logical Extent有集群级Mapping S/X Guard，可复用DRC的新映射资源类型：
+
+- Reader持有S Guard直到完成映射解析、Buffer Pin和Page Identity复验；
+- Writer持有S Guard直到取得页面DRC X和Page Latch、再次校验mapping_version、完成页面修改并生成Redo；
+- Publisher持有X Guard完成最终复制、WAL持久化、缓存失效确认和映射发布；
+- X Guard阻止新的Reader取得旧版本，并等待已存在的S Guard退出；
+- `graph_page_resolve()` 必须返回或持有Guard，不能只返回一个可能立即过期的Physical Page ID。
+
+Per-Extent Guard只串行化同一Logical Extent，不能代替共享映射节点并发控制。Extent Map固定Entry更新必须取得Leaf Page DRC X/Page Latch；Exception Compact Node采用Copy-on-Write。`graph_mapping_page_ref_t.ref_epoch` 必须等于所引用Extent Map节点的 `chunk_epoch` 或Exception节点的 `node_epoch`。每次COW发布同时递增新节点Epoch和新Reference.ref_epoch，并以完整旧Reference元组 `(physical_page_id, ref_epoch, page_generation)` 对Parent Child Reference或Root做CAS。多个节点按Root到Leaf、再按Physical Page ID顺序加锁；CAS失败丢弃未发布节点并从Root重试。这样两个不同Extent同时向同一Exception Leaf插入时不会因Compact Entry移动而互相覆盖。
+
+整Extent搬迁流程：
+
+```text
+获取Logical Extent Mapping X Guard，进入易失的MAPPING_BUSY状态
+ → 按Logical Page顺序获取所有源页DRC X与Page Latch，冻结写入
+ → 对每个Logical Page解析最终来源，包括现有Exception Page
+ → 复制到连续的新Physical Extent
+ → 保留每页page_generation，写入新的extent_epoch
+ → 校验页面身份与Checksum
+ → 先持久化新页面Redo/数据，再写映射发布Redo
+ → 原子发布新Extent Entry：
+      mapping_version递增，HAS_EXCEPTIONS清零
+ → 广播并等待Extent/Exception正负缓存失效确认
+ → 失效旧DRC资源后释放写冻结和Mapping X Guard
+ → 等待旧Buffer Pin、DCS传输和延迟响应结束
+ → 删除旧Exception元数据并回收旧默认页、Exception页和旧Extent
+```
+
+单页修复或搬迁流程：
+
+```text
+获取Logical Extent Mapping X Guard和源页DRC X/Page Latch
+ → 分配新Physical Page
+ → 复制或修复页面，保留page_generation并写新exception_epoch
+ → 持久化新页Redo/数据和Exception Entry Redo
+ → 使Exception正负缓存按新mapping_version失效并等待确认
+ → 在同一WAL发布单元中原子发布：
+      exception_map_root、所有新增Parent Child Reference、
+      Compact Bitmap/Entry数组、Exception Entry及Extent Entry
+      mapping_version递增，HAS_EXCEPTIONS置位
+ → 复验新页后释放写冻结和Mapping X Guard
+ → 等待旧Buffer Pin、DCS传输和延迟响应结束
+ → 回收原Physical Page
+```
+
+映射切换对查询SCN透明，不创建两个逻辑版本；发布前旧映射有效，发布后新映射有效。复制期间禁止未捕获的并发写；第一期使用上述阻塞式X Guard和Page Latch，后续才考虑Redo Catch-up或Dual Write。映射变更按Logical Extent串行化；实现也可以对预期 `mapping_version` 使用CAS，失败后重新解析并重试。
+
+WAL顺序必须保证“新页面内容 → 新映射元数据 → Commit/Flush”。恢复后只能得到完整旧映射或完整新映射；未发布的新Extent/Page作为孤儿空间回收。Exception合并必须先发布已包含所有最终页面的新Extent并清除 `HAS_EXCEPTIONS`，等待旧Reader和缓存退出后，才能删除旧Exception元数据。
+
+旧Physical Page复用前必须完成DRC失效确认、DCS传输结束、Buffer Pin归零、Mapping Read Guard退出以及延迟响应隔离。仅依赖Page Identity不构成ABA屏障。
+
+`extent_epoch`、`exception_epoch`、`ref_epoch`、`mapping_version` 和Node Epoch不得在陈旧引用仍可能存在时回绕复用。接近回绕时执行集群映射缓存与DRC全局静默并推进Allocation/Page Generation；无法证明安全时退休对应映射身份。
+
+Segment Head与映射元数据页的公共身份规则为：
 
 ```text
 Segment Head：
   logical_page_no    = UINT32_MAX
-  map_epoch          = 0
+  mapping_epoch      = 0
   page_generation    = 1
   page_layout_version= Segment Format Version
 
-Map Page：
-  logical_page_no    = base_logical_page_no
-  map_epoch          = Parent Reference.map_epoch
+Extent Map Page：
+  logical_page_no    = base_logical_extent_no
+  mapping_epoch      = Parent Reference.ref_epoch
   page_generation    = Parent Reference.page_generation
-  page_layout_version= Radix level
+  page_layout_version= Extent Map level
+
+Exception Map Page：
+  logical_page_no    = base_logical_page_no
+  mapping_epoch      = Parent Reference.ref_epoch
+  page_generation    = Parent Reference.page_generation
+  page_layout_version= Exception Radix level
 ```
 
-Map Page首次分配generation为1；同一物理页回收并用于新的Map Page身份时递增generation，回绕前退休。读取Map Page同时校验 `base_logical_page_no + level + segment_id`，因此不同层级或覆盖范围不能互相替代。
+映射元数据页首次分配generation为1；同一物理页回收并用于新的映射页身份时递增generation，回绕前退休。读取时同时校验Base、Level和Segment ID，因此不同层级或覆盖范围不能互相替代。
 
-Map Key是：
+数据页映射Key是：
 
 ```text
-(graph_id, virtual_partition_id, segment_kind, logical_page_no)
+(graph_id, virtual_partition_id, segment_kind, logical_extent_no)
+Exception Key另加logical_page_no
 ```
 
-Map更新与页面分配使用同一事务和Redo。读取物理页后必须反向校验页中的Graph、Segment、Virtual Partition、Logical Page、Page Epoch和Page Generation。Vertex Logical Page使用32 bit；Edge EID只允许24-bit Logical Page；Adjacency Locator使用32-bit Logical Page。
+Extent/Exception更新与页面分配使用同一事务和Redo。读取物理页后必须反向校验Graph、Segment、Virtual Partition、Logical Page和最终Mapping Epoch。Exception Entry额外提供期望Page Generation；普通Extent路径的Page Generation由Adjacency Root Locator等上层对象身份校验，不能与 `allocation_generation` 混用。Vertex Logical Page使用32 bit；Edge EID只允许24-bit Logical Page；Adjacency Locator使用32-bit Logical Page。
 
 ### 7.3 Graph页面公共身份
 
@@ -526,7 +671,7 @@ typedef struct st_graph_page_identity {
     uint32 graph_id;
     uint32 segment_id;
     uint32 logical_page_no;
-    uint32 map_epoch;
+    uint32 mapping_epoch;
     uint16 virtual_partition_id;
     uint16 page_layout_version;
     uint16 page_generation;
@@ -538,9 +683,9 @@ typedef struct st_graph_page_identity {
 } graph_page_identity_t;            /* 32B */
 ```
 
-`page_generation` 保护页级Root Locator；`map_epoch` 防止读取到迁移前的物理映射；`identity_crc` 计算时把自身字段置零，只覆盖其余Graph身份和类型扩展头。整页Checksum仍由现有Page Tail提供。
+`page_generation` 保护页级Root Locator；`mapping_epoch` 对普通页取Extent Entry的 `extent_epoch`，对异常页取Exception Entry的 `exception_epoch`，防止读取到迁移前的物理映射。`identity_crc` 计算时把自身字段置零，只覆盖其余Graph身份和类型扩展头。整页Checksum仍由现有Page Tail提供。
 
-Adjacency/Directory Logical Page第一次格式化时 `page_generation=1`。同一Logical Page回收后重新承担新的Root身份时递增Page Generation；纯物理搬迁保持Page Generation不变、只递增Map Epoch。Page Generation即将回绕时永久退休该Logical Page。
+Adjacency/Directory Logical Page第一次格式化时 `page_generation=1`。第一期不把已回收的Adjacency/Directory Logical Page Number重新分配给新的页面身份，而是永久退休；Object Slot可以在原页面身份内通过自身generation复用。因此8B `graph_adj_locator_t` 不会发生“Page Generation和Object Generation同时回绕”的ABA。纯物理搬迁保持Page Generation不变、只递增最终Mapping Epoch。
 
 ### 7.4 Locator分类
 
@@ -564,21 +709,34 @@ typedef struct st_graph_adj_locator {
 属性仍使用现有8B `rowid_t`，但Property Row必须反向校验Owner ID和generation。VID/EID Locator是运行时结构：
 
 ```c
+typedef struct st_graph_page_resolution {
+    page_id_t physical_page_id;
+    uint32 mapping_epoch;
+    uint32 mapping_version;
+    uint16 page_generation;
+    uint16 layout_id;
+    uint8  source;                  /* EXTENT/EXCEPTION */
+    uint8  reserved_zero[3];
+} graph_page_resolution_t;         /* 24B */
+
 typedef struct st_graph_slot_location {
     page_id_t physical_page_id;
-    uint32 map_epoch;
+    uint32 mapping_epoch;
+    uint32 mapping_version;
     uint16 slot_id;
     uint16 slot_size;
-} graph_slot_location_t;            /* 16B */
+} graph_slot_location_t;            /* 20B */
 ```
 
-`27 VID Locator` 和 `28 EID Locator` 都使用该结构；它们只存在于Buffer/执行器上下文中。
+`27 VID Locator` 和 `28 EID Locator` 都使用该结构；它们只存在于Buffer/执行器上下文中。Mapping Guard是运行时不透明对象，不进入持久化结构。
+
+`graph_page_resolution_t.page_generation=0` 表示普通Extent路径没有映射级期望值，调用方必须用VID/EID或Adjacency Root语义完成对象代次校验；Exception命中时该字段来自Exception Entry且必须与Page Identity一致。
 
 ### 7.5 编号结构定义索引
 
 | 编号 | 具体定义 |
 |---|---|
-| 01 | `graph_segment_head_t`、`graph_page_map_header_t/child_t/entry_t` |
+| 01 | `graph_segment_head_t`、Extent Map及Sparse Exception Page Map结构 |
 | 02–04 | `graph_page_identity_t`、`graph_vertex_page_header_t`、固定ITL/Bitmap/Slot Array布局 |
 | 05–10 | 三种 `graph_vertex_slot_*_t`、`graph_vertex_meta_t`、`graph_adj_descriptor_t` |
 | 11–13 | Phase 1不持久化；仅保留未来图级Inline Edge格式 |
@@ -759,7 +917,7 @@ Allocation Bitmap表示Slot是否已物理分配或仍被旧快照保留；可�
 ```text
 logical_page = local_sequence / slots_per_page
 slot_id      = local_sequence % slots_per_page
-page_id      = graph_page_map_resolve(VERTEX, logical_page)
+page_id      = graph_page_resolve(VERTEX, logical_page)
 ```
 
 `slots_per_page` 由页面大小、页头、ITL 和图级槽宽计算，并写入 Graph Catalog、Segment Header 与 Page Header。Vertex Inline预算创建图后不可在线修改，因为改变槽宽会改变所有 `local_sequence` 对应的逻辑页和槽号；需要更大预算时必须重建图或执行未来提供的整图重写流程。
@@ -904,7 +1062,7 @@ typedef struct st_graph_edge_page_header {
 
 EID的8-bit `slot_id` 允许0–255，页面格式化时必须验证 `slots_per_page <= 256`。Allocation Bitmap是Slot复用和恢复扫描的物理分配依据；边的查询可见性仍由Meta、ITL和Undo决定。
 
-每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Radix Page Map得到物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
+每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 优先通过Extent Map计算物理 `page_id`，仅在该Extent设置 `HAS_EXCEPTIONS` 时查询Sparse Exception Page Map，再使用页面头中的固定 `slot_size` 计算：
 
 ```text
 slot_address = slot_area + slot_id * slot_size
@@ -1909,17 +2067,20 @@ status_t graph_validate_edge_def(const graph_edge_def_t *def);
 status_t graph_make_vid(uint16 vpart, uint32 sequence, uint16 generation,
     graph_vid_t *vid);
 status_t graph_vertex_locate(graph_handle_t *handle,
-    graph_vid_t vid, graph_slot_location_t *location);
+    graph_vid_t vid, uint8 access_mode, graph_mapping_guard_t *guard,
+    graph_slot_location_t *location);
 status_t graph_make_eid(const graph_id_layout_t *id_layout,
     uint16 vpart, uint32 logical_page_no, uint8 slot_id, uint16 generation,
     graph_eid_t *eid);
 status_t graph_decode_eid(const graph_id_layout_t *id_layout,
     graph_eid_t eid, graph_eid_fields_t *fields);
 status_t graph_edge_locate(graph_handle_t *handle,
-    graph_eid_t eid, graph_slot_location_t *location);
-status_t graph_page_map_resolve(graph_handle_t *handle, uint16 vpart,
-    uint8 segment_kind, uint32 logical_page_no,
-    graph_page_map_entry_t *entry);
+    graph_eid_t eid, uint8 access_mode, graph_mapping_guard_t *guard,
+    graph_slot_location_t *location);
+status_t graph_page_resolve(graph_handle_t *handle, uint16 vpart,
+    uint8 segment_kind, uint32 logical_page_no, uint8 access_mode,
+    graph_mapping_guard_t *guard, graph_page_resolution_t *resolution);
+void graph_mapping_guard_release(graph_mapping_guard_t *guard);
 status_t graph_adj_resolve(graph_handle_t *handle, graph_vid_t owner_vid,
     uint8 direction, uint8 mode, graph_adj_locator_t locator,
     knl_scn_t query_scn, graph_adj_object_view_t *object);
@@ -1938,7 +2099,7 @@ status_t graph_expand(graph_handle_t *handle,
     const graph_expand_req_t *request, graph_expand_result_t *result);
 ```
 
-所有定位API显式接收Graph Handle，因为相同的64-bit VID/EID值在不同Graph中可以合法存在。`graph_adj_open()` 在内部复制Vertex Descriptor后释放Vertex Page latch，再解析Directory/Data Page；`graph_adj_close()` 必须释放当前Buffer、CR Page和远程预取资源。
+`access_mode` 固定为 `GRAPH_ACCESS_READ` 或 `GRAPH_ACCESS_WRITE`。所有定位API显式接收Graph Handle，因为相同的64-bit VID/EID值在不同Graph中可以合法存在。Reader成功定位后，在Mapping Guard保护下进入并Pin Buffer、校验Page Identity和 `mapping_version`，然后可以释放Guard。Writer必须继续持有Guard直到取得DRC X和Page Latch、再次校验Version、完成修改并生成Redo，之后才能调用 `graph_mapping_guard_release()`。`graph_adj_open()` 在内部复制Vertex Descriptor后释放Vertex Page latch，再解析Directory/Data Page；`graph_adj_close()` 必须释放当前Buffer、CR Page、Mapping Guard和远程预取资源。
 
 ID构造函数返回 `status_t`，在写入输出参数前校验generation非0、保留值、Virtual Partition范围以及 `logical_page_no <= 0xFFFFFF`；禁止静默截断超出持久化位宽的输入。`graph_adj_resolve()` 使用 `query_scn` 构造Directory Object的CR版本并决定Migration old/new root。
 
@@ -1982,7 +2143,8 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 槽宽、属性宽度或页面容量超限；
 - 不支持的编码、邻接模式或分片策略；
 - generation 不匹配；
-- Graph、Segment、Virtual Partition、Logical Page、Map Epoch、Page Generation、页面类型或布局版本不匹配；
+- Graph、Segment、Virtual Partition、Logical Page、Mapping Epoch、Page Generation、页面类型或布局版本不匹配；
+- Extent不是PRESENT、已经RETIRED、页偏移越界或Physical Extent跨Datafile边界；
 - 悬空 VID、EID 或 RowID；
 - OUT/IN Mode与Descriptor Root类型不匹配；
 - Adjacency owner、方向、Edge Type、Directory Version或Entry长度不匹配；
@@ -1999,17 +2161,34 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 24-bit Edge逻辑页号、8-bit Slot和16-bit generation边界；
 - generation 不匹配；
 - 所有持久化结构的大小和偏移；
-- `graph_segment_head_t`、Page Map和公共Page Identity的编码、恢复及反向校验；
-- Radix-256 Page Map跨层查找、Map Epoch变化和陈旧物理映射拒绝；
+- `graph_segment_head_t`、Extent Map、Exception Map和公共Page Identity的编码、恢复及反向校验；
+- Extent主路径直接计算、`HAS_EXCEPTIONS`条件查询、Exception Radix跨层查找和陈旧Mapping Epoch拒绝；
+- Exception命中/未命中缓存，以及异常达到阈值后的Extent合并和Exception清理；
+- Exception Bitmap的popcount Rank、Base/Level覆盖范围和紧凑Entry数量校验；
+- Logical Page边界 `0/0xFFFFFF/0xFFFFFFFF` 的64-bit覆盖范围计算；
+- Exception Entry的PRESENT/RETIRED、完整Logical Page、Layout、Epoch和Generation校验；
+- 两个Extent并发修改同一Extent/Exception Map Leaf时的Node Latch或Copy-on-Write CAS重试；
+- 复制期间并发写冻结、Resolve与Publish竞争及Mapping Guard读写互斥；
+- Writer持有Mapping S Guard直到DRC X、Page Latch、页面修改和Redo生成全部完成；
+- Exception插入前后的负缓存失效和mapping_version校验；
+- 首个Exception创建时Root、Parent Reference、Bitmap、Compact Entry和Extent Entry原子可达；
+- 有Exception时整Extent搬迁将最终页面合并进新Extent并清除Exception；
+- 新页Redo、映射发布Redo、Commit/Flush各Crash Point恢复到完整旧映射或完整新映射；
+- 进入易失MAPPING_BUSY后Crash不会在持久化Entry中留下MOVING状态；
+- Exception插入与Extent搬迁/合并并发时按Logical Extent串行化或CAS重试；
+- DRC延迟响应、DCS传输、Buffer Pin和Mapping Guard未结束前禁止复用旧Physical Page；
+- Partial Extent、Checked Page-ID Addition和Datafile边界；
+- extent/exception/ref/node Epoch及mapping_version回绕静默或退休；
 - 8KB 页面容量；
 - 固定槽页ITL区域耗尽时不移动Slot Area；
 - sequence 到页和槽的定位；
 - 图级0/8/16B Vertex Inline预算及48/56/64B Slot定位；
 - OUT/IN Mode Nibble独立变化及两个12B Descriptor的结构一致性；
 - Descriptor Root Locator无效值、Page Root、Object Root、generation不匹配和回绕退休；
+- Adjacency/Directory Logical Page回收后永久退休，Object Slot仅在原页面身份内复用；
 - 40/48/56/64B Edge Page的页内固定槽定位；
 - Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Page Layout Version和Slot宽度交叉校验；
-- Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许物理搬迁，并要求Map Epoch原子递增；Slot generation回绕时退休；
+- Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许Extent或单页物理搬迁，并要求最终Mapping Epoch原子递增；Slot generation回绕时退休；
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
@@ -2050,6 +2229,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 动态时间 Base 或 Page Base | Schema 中的明确不可变时间字面量 | 更新和迁移不会改变 Inline 语义 |
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
+| 每个Logical Page使用完整Radix Entry | Extent Map主路径 + Sparse Exception Radix | 普通访问只做Extent翻译，降低空间、缓存和查找成本 |
 
 ## 25. 总体确认清单
 
@@ -2069,7 +2249,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
 13. 第一期时间编码只提供显式 Base 的 TIME32/TIME64；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
 14. Vertex、Edge 和 OUT/IN Inline 投影使用两位状态编码，严格区分 NULL、有效值和规范原值回读。
-15. Segment使用Radix Page Map将稳定Logical Page映射到Physical Page，所有Graph Page保存并反向校验公共身份。
+15. Segment以Chunked Extent Map为主路径；单页异常使用Sparse Exception Page Map，超大Segment可用Extent级Radix容器；所有Graph Page保存并反向校验公共身份。
 16. 固定Vertex/Edge Slot Page预留不可增长的ITL区域；Adjacency/Directory使用带generation和ITL的8B Side Slot。
 17. OUT Entry保存完整dst VID，IN Entry保存完整src VID；跨分区Frontier根据Entry中的VID分桶。
 18. Property Row复用PCR Heap，但反向保存并校验Graph、Owner ID、generation和Schema Layout。
@@ -2081,4 +2261,5 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 各 Edge Type 的 OUT/IN 属性编码；
 - 超级节点晋升阈值；
 - 拉页与移动计算的切换阈值；
+- Logical Extent页数、Exception合并页数和比例阈值；
 - 最终一致模式允许的陈旧窗口。
