@@ -824,23 +824,19 @@ typedef struct st_graph_vertex_slot_0 {
 } graph_vertex_slot_0_t;            /* 48B */
 
 typedef struct st_graph_vertex_slot_8 {
-    graph_vertex_meta_t meta;       /* offset 0  */
-    uint8 inline_values[8];         /* offset 16 */
-    rowid_t property_rowid;         /* offset 24 */
-    graph_adj_descriptor_t out_adj; /* offset 32 */
-    graph_adj_descriptor_t in_adj;  /* offset 44 */
+    graph_vertex_slot_0_t base;     /* offset 0  */
+    uint8 inline_values[8];         /* offset 48 */
 } graph_vertex_slot_8_t;            /* 56B */
 
 typedef struct st_graph_vertex_slot_16 {
-    graph_vertex_meta_t meta;       /* offset 0  */
-    uint8 inline_values[16];        /* offset 16 */
-    rowid_t property_rowid;         /* offset 32 */
-    graph_adj_descriptor_t out_adj; /* offset 40 */
-    graph_adj_descriptor_t in_adj;  /* offset 52 */
+    graph_vertex_slot_0_t base;     /* offset 0  */
+    uint8 inline_values[16];        /* offset 48 */
 } graph_vertex_slot_16_t;           /* 64B */
 ```
 
-编译期必须断言三个结构的总大小和每个字段偏移。
+三个档位共享相同的48B公共前缀：Meta固定在offset 0、Property RowID固定在offset 16、OUT Descriptor固定在offset 24、IN Descriptor固定在offset 36；Inline Payload统一追加在offset 48。这样邻接遍历、属性行访问、MVCC和恢复代码不需要根据Vertex Inline档位切换公共字段偏移，并与Canonical Edge Slot的“公共前缀 + 尾部Inline Payload”布局一致。
+
+编译期必须断言三个结构的总大小、公共字段偏移以及Inline Payload起始偏移。
 
 ### 8.2 顶点页
 
@@ -2169,6 +2165,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 固定槽页ITL区域耗尽时不移动Slot Area；
 - sequence 到页和槽的定位；
 - 图级0/8/16B Vertex Inline预算及48/56/64B Slot定位；
+- 三种Vertex Slot的48B公共前缀字段偏移完全一致，8B/16B Inline Payload都从offset 48开始；
 - OUT/IN Mode Nibble独立变化及两个12B Descriptor的结构一致性；
 - Descriptor Root Locator无效值、Page Root、Object Root、generation不匹配和回绕退休；
 - Adjacency/Directory Logical Page回收后永久退休，Object Slot仅在原页面身份内复用；
@@ -2203,6 +2200,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | VID 使用 16+40+8 | 16+32+16 | 为高频删除提供足够 generation |
 | VID和EID使用相同的16+32+16解释 | VID为16+32+16；EID为16+24+8+16 | EID需要同时编码逻辑页与页内槽 |
 | 固定 128B 槽和 4–8 条内嵌边作为默认 | 图级Vertex Inline为0/8/16B，默认0B；第一期不在Vertex Slot中保存Inline Edge | 保证同一图槽宽固定，并控制百亿顶点空间和顶点页争用 |
+| Vertex Inline插在Meta与Property RowID之间 | 三档Vertex Slot共享48B公共前缀，Inline Payload统一追加在尾部 | 固定Property RowID和OUT/IN Descriptor偏移，复用访问、恢复与校验代码 |
 | 所有Canonical Edge固定64B | Page内固定，按Layout使用40/48/56/64B | 保持直接定位，同时提高无属性边和窄边的页面密度 |
 | 邻接项使用 edge_token | 普通邻接项使用完整 EID | 降低重建和恢复复杂度 |
 | 用户配置 Covering Properties | 用户配置 EDGE/OUT/IN INLINE | 直接表达三个物理副本 |
