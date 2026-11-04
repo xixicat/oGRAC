@@ -441,11 +441,11 @@ typedef struct st_graph_mapping_page_ref {
 
 ```c
 typedef struct st_graph_segment_head {
+    uint8  segment_format_version;  /* V1=1 */
+    uint8  header_bytes;            /* V1=60 */
+    uint16 virtual_partition_id;
     uint32 graph_id;
     uint32 segment_id;
-    uint16 virtual_partition_id;
-    uint8  segment_kind;
-    uint8  format_version;
     graph_mapping_page_ref_t extent_map_root;
     uint32 next_logical_page_no;
     uint32 allocated_page_count;
@@ -482,12 +482,13 @@ typedef struct st_graph_extent_map_entry {
 
 ```c
 typedef struct st_graph_extent_map_header {
+    uint8  extent_map_format_version; /* V1=1 */
+    uint8  header_bytes;              /* V1=24 */
+    uint8  level;                     /* 0=256个Extent Entry */
+    uint8  reserved_zero;
     uint32 graph_id;
     uint32 segment_id;
     uint32 base_logical_extent_no;
-    uint16 virtual_partition_id;
-    uint8  segment_kind;
-    uint8  level;                   /* 0=256个Extent Entry */
     uint16 entry_count;
     uint16 flags;
     uint32 chunk_epoch;
@@ -584,7 +585,7 @@ ABR请求上下文按Page Type取得期望身份：
 - Root Extent Map页：从Segment Head的 `extent_map_root` 取得；
 - Child Extent Map页：从受保护的Parent Reference取得。
 
-上下文必须包含期望的Page ID、Page Type，以及适用于该页的Graph、Segment、Virtual Partition、Segment Kind、Logical Page/Base、Mapping Epoch、Page Generation和Layout Level。接收或Redo完成后，必须先校验修复页的Page ID、Graph Page Identity、Page Type和PCN，再计算/验证Checksum；任一项不匹配都必须中止，禁止重算Checksum后写回。原位写回成功后再次校验Buffer中的Graph Page Identity和Checksum。
+上下文必须包含期望的Page ID、Page Type，以及适用于该页的Graph、Segment、Virtual Partition、Segment Kind、Logical Page/Base、Mapping Epoch、Page Generation和Radix Level。Identity Version和Page Type Format Version不要求由Locator重复保存；ABR必须把修复页中的版本校验为当前集群兼容矩阵明确支持的组合，并按该组合注册的Header长度解析，禁止由损坏页自行定义长度。接收或Redo完成后，必须先校验修复页的Page ID、Graph Page Identity、Page Type、版本支持状态、对应类型Header和PCN，再计算/验证Checksum；任一项不匹配都必须中止，禁止重算Checksum后写回。原位写回成功后再次校验Buffer中的Graph Page Identity和Checksum。
 
 若原位置永久不可写，由存储层完成坏块重映射，或由数据库执行上述整Extent搬迁；第一期不提供Graph单页映射覆盖。Catalog仅预留 `GRAPH_MAP_FEATURE_PAGE_EXCEPTION` 格式特性位，第一期始终关闭且不分配对应Page Type或持久化结构；未来启用必须增加Mapping Format Version并提供迁移流程。
 
@@ -595,13 +596,14 @@ Segment Head：
   logical_page_no    = UINT32_MAX
   mapping_epoch      = 0
   page_generation    = 1
-  page_layout_version= Segment Format Version
+  segment_format_version = Segment Head格式版本
 
 Extent Map Page：
   logical_page_no    = base_logical_extent_no
   mapping_epoch      = Parent Reference.ref_epoch
   page_generation    = Parent Reference.page_generation
-  page_layout_version= Extent Map level
+  extent_map_format_version = Extent Map格式版本
+  level              = Extent Radix层级
 ```
 
 映射元数据页首次分配generation为1；同一物理页回收并用于新的映射页身份时递增generation，回绕前退休。读取时同时校验Base、Level和Segment ID，因此不同层级或覆盖范围不能互相替代。
@@ -616,26 +618,39 @@ Extent Map更新与页面分配使用同一事务和Redo。读取物理页后必
 
 ### 7.3 Graph页面公共身份
 
-每张Graph页面在现有 `page_head_t` 后保存32B公共身份：
+每张原生Graph页面在现有 `page_head_t` 后保存24B公共身份。公共Identity只管理Graph身份格式；Vertex、Edge、Segment、Extent Map和Adjacency等具体页面格式分别由各自类型Header管理：
 
 ```c
 typedef struct st_graph_page_identity {
+    uint8  identity_version;        /* V1=1 */
+    uint8  identity_bytes;          /* V1=24 */
+    uint8  segment_kind;
+    uint8  reserved_zero;
     uint32 graph_id;
     uint32 segment_id;
     uint32 logical_page_no;
     uint32 mapping_epoch;
     uint16 virtual_partition_id;
-    uint16 page_layout_version;
     uint16 page_generation;
-    uint16 header_bytes;
-    uint8  segment_kind;
-    uint8  flags;
-    uint16 reserved_zero;
-    uint32 identity_crc;
-} graph_page_identity_t;            /* 32B */
+} graph_page_identity_t;            /* 24B */
 ```
 
-`page_generation` 保护页级Root Locator；`mapping_epoch` 始终取Extent Entry的 `extent_epoch`，防止读取到搬迁前的物理映射。`identity_crc` 计算时把自身字段置零，只覆盖其余Graph身份和类型扩展头。整页Checksum仍由现有Page Tail提供。
+兼容前缀的前4B位置和语义永久不变。V1要求 `identity_version=1`、`identity_bytes=24`；未来Identity版本只能在24B之后追加4B对齐字段，不能重排V1字段。读取器先校验 `identity_version`，再以 `identity_bytes` 定位Page Type Header；未知Identity版本必须拒绝，不能猜测解析。`identity_bytes` 必须不小于24、不超过252且为4的倍数。滚动升级期间，在所有节点支持新Identity版本前不得写入该版本。
+
+`page_generation` 保护页级Root Locator。数据页的 `mapping_epoch` 取Extent Entry的 `extent_epoch`，防止读取到搬迁前的物理映射；Segment Head固定为0，Extent Map页取Parent Reference的 `ref_epoch`。公共Identity不再保存 `page_layout_version`、通用 `header_bytes`、通用Flags或独立CRC；具体格式版本和Header长度属于各Page Type Header，完整性由现有整页Checksum保护。
+
+所有原生Graph Page Type Header都以固定2B兼容前缀开始：
+
+```text
+uint8 <page_type>_format_version   /* 0非法，V1=1，1–254正式版本，255保留 */
+uint8 header_bytes                 /* 包含该Page Type Header自身，不含公共Identity */
+```
+
+每个受支持的Page Type Format Version都在兼容矩阵中注册唯一的精确 `header_bytes`；读取时要求Header长度等于该注册值、为4的倍数，并且不超过扣除 `page_head_t`、公共Identity和 `page_tail_t` 后的页面剩余空间。同一Format Version不得改变Header长度或字段语义。未来版本只能在V1 Header末尾追加字段，同时递增Format Version和 `header_bytes`；支持该新版本的读取器可以用长度跳过自己不消费但已注册的扩展字段，旧读取器必须因未知版本拒绝，不能仅凭长度继续解析。
+
+每个Page Type独立递增自己的8-bit格式版本，版本不回绕、不复用；0非法，1–254为正式版本，255保留。`identity_version` 变化不强迫所有Page Type升级，某个Page Type升级也不改变公共Identity版本。滚动升级期间，每个Identity或Page Type新版本都必须先进入集群兼容矩阵，只有所有可能读取、恢复或接管该页的节点均声明支持后才允许写入。Extent Map的 `level`、Edge/Adjacency的 `schema_layout_id` 与格式版本分别表达树层级、业务Schema和物理编码，禁止混用。
+
+本文定义的是尚未落盘的初始V1 ABI；此前文档中的32B无版本Identity只是设计草案，不属于可读取的V0格式，也不提供原位兼容。如果已有实验数据按旧草案写盘，必须离线重建或显式迁移，不能由V1读取器启发式识别。“新读取器读取旧版本”仅指未来V2及以后读取已正式落盘的V1页面。
 
 Adjacency/Directory Logical Page第一次格式化时 `page_generation=1`。第一期不把已回收的Adjacency/Directory Logical Page Number重新分配给新的页面身份，而是永久退休；Object Slot可以在原页面身份内通过自身generation复用。因此8B `graph_adj_locator_t` 不会发生“Page Generation和Object Generation同时回绕”的ABA。整Extent物理搬迁保持Page Generation不变、只递增Extent Epoch。
 
@@ -845,6 +860,8 @@ page_tail_t
 
 ```c
 typedef struct st_graph_vertex_page_header {
+    uint8  vertex_format_version;   /* V1=1 */
+    uint8  header_bytes;            /* V1=24 */
     uint16 slot_size;               /* 48/56/64 */
     uint16 slots_per_page;
     uint16 used_slots;
@@ -856,7 +873,7 @@ typedef struct st_graph_vertex_page_header {
     uint8  itl_count;
     uint8  itl_capacity;
     uint16 flags;
-    uint32 reserved_zero;
+    uint16 reserved_zero;
 } graph_vertex_page_header_t;       /* 24B */
 ```
 
@@ -972,7 +989,7 @@ graph_id
 + PAGE_TYPE_GRAPH_EDGE
 + edge_type_id
 + schema_layout_id
-+ page_layout_version
++ edge_format_version
 ```
 
 页面头持久化上述全部身份字段以及 `slot_size` 和 `slots_per_page`。同一页面中的所有Slot必须具有相同的Edge Type、Schema Layout和Slot宽度；页面清空后这些字段也不可改变。`edge_type_id` 虽然可以通过 `schema_layout_id` 查询，仍冗余保存在页头中，用于恢复、页面转储和损坏校验。
@@ -993,8 +1010,10 @@ page_tail_t
 
 ```c
 typedef struct st_graph_edge_page_header {
-    uint32 edge_type_id;
+    uint8  edge_format_version;     /* V1=1 */
+    uint8  header_bytes;            /* V1=32 */
     uint16 schema_layout_id;
+    uint32 edge_type_id;
     uint16 slot_size;               /* 40/48/56/64 */
     uint16 slots_per_page;          /* 必须 <= 256 */
     uint16 used_slots;
@@ -1006,7 +1025,7 @@ typedef struct st_graph_edge_page_header {
     uint8  itl_count;
     uint8  itl_capacity;
     uint16 flags;
-    uint8  reserved_zero[6];
+    uint8  reserved_zero[4];
 } graph_edge_page_header_t;         /* 32B */
 ```
 
@@ -1120,20 +1139,22 @@ page_tail_t
 
 ```c
 typedef struct st_graph_adj_dir_page_header {
+    uint8  adj_dir_format_version;  /* V1=1 */
+    uint8  header_bytes;            /* V1=48 */
+    uint16 object_count;
     graph_vid_t owner_vid;
     uint8  direction;
     uint8  directory_level;
-    uint16 object_count;
+    uint16 free_begin;
     uint32 live_object_count;
     uint32 directory_version;
     graph_adj_locator_t next_page;
     graph_adj_locator_t prev_page;
-    uint16 free_begin;
     uint16 free_end;
     uint8  itl_count;
     uint8  itl_capacity;
     uint16 flags;                    /* PACKED/EXTERNAL/SHARD/MIGRATION */
-    uint32 reserved_zero;
+    uint16 reserved_zero;
 } graph_adj_dir_page_header_t;       /* 48B */
 ```
 
@@ -1286,15 +1307,18 @@ page_tail_t
 
 ```c
 typedef struct st_graph_adj_data_page_header {
+    uint8  adj_data_format_version; /* V1=1 */
+    uint8  header_bytes;            /* V1=64 */
+    uint16 schema_layout_id;
     graph_vid_t owner_vid;
     uint32 edge_type_id;
-    uint16 schema_layout_id;
     uint8  direction;
     uint8  entry_format;
     uint16 shard_id;
     uint16 shard_count;
     uint16 entry_size;
     uint16 slot_count;
+    uint16 reserved_zero;
     uint32 live_count;
     uint32 flags;
     graph_adj_locator_t next_page;
@@ -1308,7 +1332,6 @@ typedef struct st_graph_adj_data_page_header {
     uint16 free_end;
     uint8  itl_count;
     uint8  itl_capacity;
-    uint32 reserved_zero;
 } graph_adj_data_page_header_t;      /* 64B */
 ```
 
@@ -2093,7 +2116,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 槽宽、属性宽度或页面容量超限；
 - 不支持的编码、邻接模式或分片策略；
 - generation 不匹配；
-- Graph、Segment、Virtual Partition、Logical Page、Mapping Epoch、Page Generation、页面类型或布局版本不匹配；
+- Graph、Segment、Virtual Partition、Logical Page、Mapping Epoch、Page Generation、页面类型、Identity Version或Page Type Format Version不匹配；
 - Extent不是PRESENT、已经RETIRED、页偏移越界或Physical Extent跨Datafile边界；
 - 悬空 VID、EID 或 RowID；
 - OUT/IN Mode与Descriptor Root类型不匹配；
@@ -2112,6 +2135,11 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - generation 不匹配；
 - 所有持久化结构的大小和偏移；
 - `graph_segment_head_t`、Extent Map和公共Page Identity的编码、恢复及反向校验；
+- `graph_page_identity_t` V1固定24B，前4B兼容前缀、`identity_bytes`边界与4B对齐校验；
+- 未来V2读取器读取正式V1 Identity，V1读取器拒绝未知Identity Version；此前32B无版本草案只允许迁移或重建；
+- Segment、Extent Map、Vertex、Edge、Adjacency Directory和Adjacency Data格式版本独立演进，升级其中一种不改变其他Page Type版本；
+- Identity及每种Page Type新版本在全体可接管节点支持前禁止写入；
+- 各Page Type Header的注册版本与精确 `header_bytes` 匹配、4B对齐、页面边界、追加字段定位和未知Format Version拒绝；
 - Extent主路径直接计算、Extent级Radix跨层查找和陈旧Mapping Epoch拒绝；
 - Logical Page边界 `0/0xFFFFFF/0xFFFFFFFF` 的64-bit覆盖范围计算；
 - Extent Entry的PRESENT/RETIRED、页偏移、Page Count、Extent Epoch和Allocation Generation校验；
@@ -2132,6 +2160,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Standby ABR将Graph坏页修复到原Buffer与原 `page_id`，不更新Extent Map；
 - Backup + Redo ABR只接受同一 `page_id`，并由 `RESTORE FLUSHPAGE` 写回原file/page offset；
 - 数据页、Segment Head、Root/Child Extent Map页分别从Extent Entry、Catalog、Segment Head Root、Parent Reference构造ABR预期身份；
+- ABR只接受集群兼容矩阵支持的Identity/Page Type Format Version组合，并使用注册的精确Header长度解析；
 - Graph各Page Type在Checksum重算和任何写回前，按ABR请求上下文校验完整Page Identity、Page Type、PCN和Page ID；不匹配时拒绝写回；
 - Graph各Page Type完成ABR原位写回后再次通过Page Identity与Checksum校验；
 - 原位置永久不可写时由存储层坏块重映射或整Extent搬迁，第一期不存在单页映射覆盖；
@@ -2144,7 +2173,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Descriptor Root Locator无效值、Page Root、Object Root、generation不匹配和回绕退休；
 - Adjacency/Directory Logical Page回收后永久退休，Object Slot仅在原页面身份内复用；
 - 40/48/56/64B Edge Page的页内固定槽定位；
-- Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Page Layout Version和Slot宽度交叉校验；
+- Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Edge Format Version和Slot宽度交叉校验；
 - Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许整Extent物理搬迁，并要求Extent Epoch原子递增；Slot generation回绕时退休；
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
@@ -2187,6 +2216,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
 | 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
+| 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 
 ## 25. 总体确认清单
 
@@ -2210,6 +2240,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 16. 固定Vertex/Edge Slot Page预留不可增长的ITL区域；Adjacency/Directory使用带generation和ITL的8B Side Slot。
 17. OUT Entry保存完整dst VID，IN Entry保存完整src VID；跨分区Frontier根据Entry中的VID分桶。
 18. Property Row复用PCR Heap，但反向保存并校验Graph、Owner ID、generation和Schema Layout。
+19. 公共Graph Page Identity固定24B V1兼容前缀；Segment、Extent Map、Vertex、Edge和两类Adjacency页面在各自Header中独立管理8-bit Format Version与Header长度。
 
 以下参数保留为上线前基准测试项，不改变上述结构：
 
