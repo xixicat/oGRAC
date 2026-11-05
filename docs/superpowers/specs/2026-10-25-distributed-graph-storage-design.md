@@ -760,7 +760,8 @@ bit 4  IN_ADJ_PRESENT
 bit 5  SUPERNODE
 bit 6  MIGRATING
 bit 7  FROZEN
-bit 8–15 reserved
+bit 8  RETIRED
+bit 9–15 reserved
 ```
 
 删除标记受MVCC保护，旧快照结束后才允许回收。读取VID时必须同时满足 `ALLOCATED`、非可见删除且 `VID.generation == vertex_meta.generation`。
@@ -873,7 +874,58 @@ typedef struct st_graph_vertex_page_header {
 } graph_vertex_page_header_t;       /* 24B */
 ```
 
-Allocation Bitmap表示Slot是否已物理分配或仍被旧快照保留；可见性仍由Slot Meta和PCR MVCC决定。删除后的Slot只有在所有旧快照结束后才清除Bitmap并进入可复用状态。
+Vertex Allocation Bitmap固定放在预留PCR ITL数组之后、Vertex Slot Array之前，不是Header中的C数组。页面格式化时按以下公式持久化位置和长度：
+
+```text
+itl_offset =
+    sizeof(page_head_t)
+  + graph_page_identity_t.identity_bytes
+  + graph_vertex_page_header_t.header_bytes
+
+bitmap_offset =
+    itl_offset
+  + itl_capacity * sizeof(pcr_itl_t)
+
+bitmap_bytes =
+    ceil(slots_per_page / 8)
+
+slot_area_offset =
+    align8(bitmap_offset + bitmap_bytes)
+```
+
+Slot `n` 使用LSB-first位序：
+
+```text
+byte = bitmap[n >> 3]
+mask = 1U << (n & 7)
+
+(byte & mask) == 0  → 未分配，可复用
+(byte & mask) != 0  → 已分配，或删除后仍被旧快照保留
+```
+
+最后一个Bitmap字节中超出 `slots_per_page` 的尾部保留bit在格式化时写1，扫描器仍必须以 `slots_per_page` 为上界。`used_slots` 等于有效Slot范围内置位数，不包括尾部保留bit；它统计正在使用、等待安全回收和永久退休的物理Slot，不等于当前可见顶点数。
+
+`free_hint` 是Slot编号，只是可陈旧的扫描起点，不是空闲状态的权威来源。插入在Page Latch下从 `free_hint` 开始扫描Bitmap并最多回绕一次；找到Slot `n` 后，首次分配设置 `generation=1`，复用时要求旧generation小于 `UINT16_MAX` 并递增，然后初始化Slot、置位Bitmap和递增 `used_slots`。若递增后 `used_slots == slots_per_page`，Hint写 `UINT16_MAX`；否则写 `(n + 1) % slots_per_page`，允许暂时指向另一个已置位Slot。Hint指向已分配Slot不构成损坏，扫描器继续查找。
+
+Bitmap是物理分配依据；Vertex Meta、PCR ITL和Undo决定事务可见性。删除只先写MVCC删除状态。只有删除事务已提交且不会回滚、所有可能读取删除前版本的快照均结束、对应Undo不再需要该Slot后，后台清理才可以回收。
+
+安全回收必须在同一Page Latch和Redo原子单元中清除Bitmap bit、递减 `used_slots` 并设置 `free_hint = deleted_slot_id`（原Hint有效时可取二者较小值）。Slot中原generation继续保留，等待下次分配时递增。若被删除Slot的generation已经是 `UINT16_MAX`，则设置Vertex Meta `RETIRED`、永久保留Bitmap bit和 `used_slots`，不得把该Slot加入空闲候选。
+
+插入时的Slot初始化、Bitmap置位、`used_slots/free_hint`更新同样必须在一个Page Latch和Redo原子单元中，恢复后不得出现“bit已置位但Slot未初始化”。页面读取和恢复必须校验：
+
+```text
+itl_offset == sizeof(page_head_t) + identity_bytes + header_bytes
+itl_count <= itl_capacity
+bitmap_offset == itl_offset + itl_capacity * sizeof(pcr_itl_t)
+bitmap_bytes  == ceil(slots_per_page / 8)
+slot_area_offset == align8(bitmap_offset + bitmap_bytes)
+slot_area_offset + slots_per_page * slot_size <= page_size - sizeof(page_tail_t)
+尾部保留bit全部为1
+used_slots == popcount(bitmap[0 .. slots_per_page))
+used_slots == slots_per_page  → free_hint == UINT16_MAX
+used_slots < slots_per_page   → free_hint < slots_per_page
+RETIRED Slot的Bitmap bit必须为1且generation == UINT16_MAX
+```
 
 `04` 中的槽宽在图级别固定，因此：
 
@@ -948,6 +1000,21 @@ typedef struct st_graph_edge_meta {
     uint8  validity_flags;
     uint8  reserved_zero;
 } graph_edge_meta_t;                /* 16B */
+```
+
+Edge Meta `flags` 的持久化位定义为：
+
+```text
+bit 0  ALLOCATED
+bit 1  DELETED
+bit 2  RETIRED
+bit 3  HAS_PROPERTY_ROW
+bit 4  OUT_ADJ_COPY_PRESENT
+bit 5  IN_ADJ_COPY_PRESENT
+bit 6  TEMPORAL
+bit 7  HAS_VECTOR_REF
+bit 8  MIGRATING
+bit 9–15 reserved
 ```
 
 Canonical Edge Slot的共同前缀和物理偏移为：
@@ -1027,6 +1094,33 @@ typedef struct st_graph_edge_page_header {
 
 EID的8-bit `slot_id` 允许0–255，页面格式化时必须验证 `slots_per_page <= 256`。Allocation Bitmap是Slot复用和恢复扫描的物理分配依据；边的查询可见性仍由Meta、ITL和Undo决定。
 
+Edge Allocation Bitmap固定放在预留PCR ITL数组之后、Canonical Edge Slot Array之前：
+
+```text
+itl_offset =
+    sizeof(page_head_t)
+  + graph_page_identity_t.identity_bytes
+  + graph_edge_page_header_t.header_bytes
+
+bitmap_offset =
+    itl_offset
+  + itl_capacity * sizeof(pcr_itl_t)
+
+bitmap_bytes =
+    ceil(slots_per_page / 8)
+
+slot_area_offset =
+    align8(bitmap_offset + bitmap_bytes)
+```
+
+Edge Slot也使用 `bitmap[slot_id >> 3]` 和 `1U << (slot_id & 7)` 的LSB-first位序。0表示未分配，1表示已分配、等待安全回收或永久退休；最后一个字节超出 `slots_per_page` 的尾部保留bit初始化为1，且不计入 `used_slots`。`used_slots` 等于有效Slot范围内的置位数，不等于当前可见边数。
+
+`free_hint`只是可陈旧的扫描起点。插入在Page Latch下从Hint开始并最多回绕一次，以Bitmap找到Slot `n`；分配完成后，满页写 `UINT16_MAX`，否则写 `(n + 1) % slots_per_page`。首次分配generation为1，复用时递增且禁止从 `UINT16_MAX` 回绕。
+
+删除边时先保留Bitmap bit并依赖Edge Meta、ITL和Undo提供旧版本可见性。只有删除事务已提交且不会回滚、旧快照结束并且Undo不再需要该Slot后，才能在同一Page Latch和Redo原子单元中清bit、递减 `used_slots`、保留generation并降低Hint。generation已经为 `UINT16_MAX` 时设置Edge Meta `RETIRED`，保持bit和 `used_slots`不变并永久禁止复用。
+
+Edge Page读取和恢复必须执行与Vertex Page相同的精确Offset、长度、尾部bit、`used_slots/free_hint`和RETIRED校验，并额外验证 `slots_per_page <= 256`。Edge Slot初始化、Bitmap置位、计数和Hint更新也必须属于同一Page Latch和Redo原子单元。
+
 每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Extent Map计算物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
 
 ```text
@@ -1037,7 +1131,7 @@ slot_address = slot_area + slot_id * slot_size
 
 规范边是属性事实来源。出邻接和入邻接中的属性是为遍历准备的副本。
 
-`flags` 表示已使用、已删除、存在属性行、存在出邻接副本、存在入邻接副本、时态边、关联向量和迁移状态。`property_mode` 表示属性位于规范槽、规范槽加属性行、仅属性行、LOB 或向量引用。
+`flags` 表示已使用、已删除、永久退休、存在属性行、存在出邻接副本、存在入邻接副本、时态边、关联向量和迁移状态。`property_mode` 表示属性位于规范槽、规范槽加属性行、仅属性行、LOB 或向量引用。
 
 跨分区边必须满足以下损坏校验规则：
 
@@ -2163,6 +2257,12 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Phase 1拒绝启用 `GRAPH_MAP_FEATURE_PAGE_EXCEPTION`，不注册或分配对应Page Type及持久化结构；
 - 8KB 页面容量；
 - 固定槽页ITL区域耗尽时不移动Slot Area；
+- Vertex/Edge Allocation Bitmap位于固定ITL数组和Slot Array之间，Offset/Bytes公式及页面边界校验；
+- Allocation Bitmap的LSB-first位序、尾部保留bit为1、`used_slots`仅统计有效Slot；
+- `free_hint`陈旧、回绕、满页 `UINT16_MAX`、删除后降低Hint及越界损坏校验；
+- Slot初始化、Bitmap置位、`used_slots/free_hint`更新的Redo原子性；
+- 删除事务提交且不可回滚、旧快照结束、Undo不再引用后，清bit、递减计数和降低Hint的Redo原子性；
+- generation为 `UINT16_MAX` 的Vertex/Edge Slot转为RETIRED，保持Bitmap bit和 `used_slots`且永久不可复用；
 - sequence 到页和槽的定位；
 - 图级0/8/16B Vertex Inline预算及48/56/64B Slot定位；
 - 三种Vertex Slot的48B公共前缀字段偏移完全一致，8B/16B Inline Payload都从offset 48开始；
