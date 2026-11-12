@@ -1162,7 +1162,7 @@ IN Entry.neighbor_vid                 == src_vid
 - 优化器需要按 Edge Type 读取度数；
 - 超级节点需要保存大量分片入口；
 - 在线重建时原子切换根指针；
-- 每种边独立维护 Zone Map、Bloom Filter 和压缩格式。
+- 每种边独立选择 Schema Layout、排序和分片策略。
 
 如果所有边共用一个邻接指针，查询 `MANAGES` 时可能扫描大量 `CLICKED` 边。目录让查询直接进入目标 Edge Type。
 
@@ -1385,7 +1385,6 @@ IN INLINE 中存在：更新目标顶点入邻接项
 page_head_t
 graph_page_identity_t
 graph_adj_data_page_header_t
-Zone Map / Bloom元数据
 Adjacency Entry payloads →
 free space
 ← graph_adj_slot_t array
@@ -1393,12 +1392,12 @@ free space
 page_tail_t
 ```
 
-类型扩展头为64B：
+Phase 1类型扩展头为56B，不持久化Zone Map、Bloom Filter或页面级失效投影掩码：
 
 ```c
 typedef struct st_graph_adj_data_page_header {
     uint8  adj_data_format_version; /* V1=1 */
-    uint8  header_bytes;            /* V1=64 */
+    uint8  header_bytes;            /* V1=56 */
     uint16 schema_layout_id;
     graph_vid_t owner_vid;
     uint32 edge_type_id;
@@ -1408,28 +1407,32 @@ typedef struct st_graph_adj_data_page_header {
     uint16 shard_count;
     uint16 entry_size;
     uint16 slot_count;
-    uint16 reserved_zero;
+    uint16 reserved_zero1;
     uint32 live_count;
     uint32 flags;
     graph_adj_locator_t next_page;
     uint32 directory_version;
-    uint16 zone_map_offset;
-    uint16 zone_map_bytes;
-    uint16 bloom_offset;
-    uint16 bloom_bytes;
-    uint16 invalid_projection_mask;
     uint16 free_begin;
     uint16 free_end;
     uint8  itl_count;
     uint8  itl_capacity;
-} graph_adj_data_page_header_t;      /* 64B */
+    uint16 reserved_zero2;
+} graph_adj_data_page_header_t;      /* 56B */
+```
+
+`free_begin` 是下一个Entry Payload的写入位置，`free_end` 是反向增长的Side Slot数组起点；可用空间为 `free_end - free_begin`。页面整理可以移动Payload并更新Side Slot中的 `entry_offset`，但不能改变稳定Slot编号和generation。读取时必须满足：
+
+```text
+header_end <= free_begin <= free_end
+free_end <= 固定ITL区域起点
+itl_count <= itl_capacity
 ```
 
 `next_page` 形成同一个 `(owner_vid, direction, edge_type_id, shard_id)` 的页面链。每次进入页面必须校验这些字段、Schema Layout、Directory Version和Page Generation。
 
-查询可以先用页头范围跳过整页，再用邻接项属性过滤，最后只读取命中的规范边和顶点。如果谓词对应的投影在本页存在失效项，则 Zone Map 只能处理有效项，失效项必须进入原值回读队列，不能被当作“不匹配”跳过。
+Phase 1查询扫描页内可见Adjacency Entry及其Inline状态，不能依赖页面级范围或集合摘要跳页。Zone Map、Bloom Filter和 `invalid_projection_mask` 只有在基准测试证明收益后，才作为 `adj_data_format_version=2` 的追加字段引入；V2必须增加 `header_bytes` 并注册精确长度。已有V1页面通过后台整页重写升级，不能在原Header中原地扩展。启用V2前仍受集群兼容矩阵和全节点写入门禁约束。
 
-Directory计数、Data Page的 `live_count`、Zone Map和Bloom Filter都是保守摘要，不决定MVCC可见性。摘要落后只能导致额外扫描，不能排除可能可见的数据；恢复时可以根据可见Entry重新计算。每个Vertex、Canonical Edge、Directory Object和External Adjacency Entry分别通过所在页面的Side Slot或Meta引用PCR ITL；Packed List整体使用一个Object Slot。创建一条边时这些记录可以使用不同页内ITL编号，但必须属于同一个数据库事务。
+Directory计数和Data Page的 `live_count` 是保守摘要，不决定MVCC可见性。计数落后只能导致额外扫描，不能排除可能可见的数据；恢复时可以根据可见Entry重新计算。每个Vertex、Canonical Edge、Directory Object和External Adjacency Entry分别通过所在页面的Side Slot或Meta引用PCR ITL；Packed List整体使用一个Object Slot。创建一条边时这些记录可以使用不同页内ITL编号，但必须属于同一个数据库事务。
 
 ### 11.4 时间 Inline 类型
 
@@ -1513,7 +1516,7 @@ OVERFLOW = REJECT | WARNING
 
 状态 `00` 表示逻辑 NULL，不需要回读；状态 `01` 才允许直接解码 Inline 字节。状态 `10` 不能被当作 NULL 或“不匹配”。
 
-OUT/IN `inline_property_state_bitmap` 属于8B或16B方向负载预算，不额外扩大Entry。Page Header的 `invalid_projection_mask` 只记录每个属性是否存在至少一个状态 `10`，不保存精确计数；只要对应bit为1，使用该属性的Zone Map就不能排除这些项。
+OUT/IN `inline_property_state_bitmap` 属于8B或16B方向负载预算，不额外扩大Entry。Phase 1没有页面级 `invalid_projection_mask`，执行器必须逐Entry识别状态 `10` 并回读规范值。未来V2页面摘要也只能跳过状态 `01` 的值，不能因摘要不匹配而跳过状态 `10` 的Entry。
 
 `WARNING` 保证SQL成功和结果正确，但可能降低查询性能。精确失效计数由后台统计扫描写入Catalog统计，不属于Adjacency Page持久化头；系统视图基于该统计暴露每个Inline投影的失效率，超过阈值时建议修改Base、目标类型或移除该投影。
 
@@ -1689,7 +1692,7 @@ Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 L
  → 将Descriptor复制到执行器并释放Vertex Page latch
  → 按Mode解析Root
  → 定位CLICKED OUT
- → 页头Zone Map/Bloom跳过不符合时间范围的页
+ → 逐Entry扫描OUT Inline时间投影，状态10的项回读规范值
  → 16中按PCR可见性读取neighbor_vid、EID及OUT Inline属性
  → 得到seed VID和click EID
 ```
@@ -1803,10 +1806,10 @@ candidate VID → 26/05 → 07 热属性 → 必要时 08/24
 Canonical Edge Slot
 源顶点OUT Adjacency Entry
 目标顶点IN Adjacency Entry
-必要的Directory计数和摘要失效标记
+必要的Directory计数
 ```
 
-摘要允许延迟重算，但三个可见记录必须原子删除。只有早于删除SCN的查询全部结束后，Adjacency Object Slot和Canonical Edge Slot才允许递增generation并复用。
+Directory计数可以延迟修正为保守值，但三个可见记录必须原子删除。只有早于删除SCN的查询全部结束后，Adjacency Object Slot和Canonical Edge Slot才允许递增generation并复用。
 
 第一期普通 `DELETE vertex` 采用 `RESTRICT`：只要任一方向存在可见边就拒绝。`DETACH DELETE` 同步删除所有入边、出边和Canonical Edge后再删除Vertex；不提供可能留下悬空 `neighbor_vid` 的异步清理。Vertex Slot只有在全部邻接清理且旧快照结束后才能复用。
 
@@ -2278,13 +2281,14 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
 - Directory/Adjacency Side Slot整理不改变object_slot和generation；
 - OUT Entry保存dst VID、IN Entry保存src VID，并按对方VID跨分区分桶；
-- Directory计数、Zone Map和Bloom摘要陈旧时只能增加扫描、不能漏结果；
+- Directory计数和 `live_count` 陈旧时只能增加扫描、不能漏结果；
+- Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
 - Property Row反向校验Graph、Owner ID、generation和Schema Layout；
 - 多 Label Set；
 - TIME32/TIME64 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
-- WARNING 状态 `10` 不能被 Zone Map 错误排除，并能批量回读规范值；
+- WARNING 状态 `10` 必须逐Entry识别，不能被页面级判断错误排除，并能批量回读规范值；
 - 任意确定性表达式的规范化匹配，以及非确定性表达式拒绝；
 - `HASH32_VERIFY` 的多列、NULL、类型、Collation、参数顺序和碰撞后原值验证；
 - Hash 算法版本在不同节点和恢复后的稳定性；
@@ -2314,6 +2318,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
 | 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
+| Phase 1邻接页持久化Zone Map、Bloom和失效掩码 | 56B Header只保留 `free_begin/free_end`；摘要延后到Format V2 | 8KB页面直接扫描成本较低，避免未经基准验证的摘要维护、删除重建和MVCC复杂度 |
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 
 ## 25. 总体确认清单
@@ -2339,6 +2344,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 17. OUT Entry保存完整dst VID，IN Entry保存完整src VID；跨分区Frontier根据Entry中的VID分桶。
 18. Property Row复用PCR Heap，但反向保存并校验Graph、Owner ID、generation和Schema Layout。
 19. 公共Graph Page Identity固定24B V1兼容前缀；Segment、Extent Map、Vertex、Edge和两类Adjacency页面在各自Header中独立管理8-bit Format Version与Header长度。
+20. Phase 1 Adjacency Data Header为56B，只使用 `free_begin/free_end` 管理变长空间；Zone Map、Bloom Filter和页面级失效掩码延后到独立Format V2，并通过整页重写启用。
 
 以下参数保留为上线前基准测试项，不改变上述结构：
 
