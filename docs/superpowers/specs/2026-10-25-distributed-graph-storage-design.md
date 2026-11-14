@@ -1239,7 +1239,7 @@ typedef struct st_graph_adj_dir_page_header {
     uint16 object_count;            /* offset 12 */
     uint16 flags;                   /* offset 14, PACKED/EXTERNAL/SHARD/MIGRATION */
     uint32 live_object_count;       /* offset 16 */
-    uint32 directory_version;       /* offset 20 */
+    uint32 directory_version;       /* offset 20，固定32 bit */
 
     uint16 free_begin;              /* offset 24 */
     uint16 free_end;                /* offset 26 */
@@ -1261,6 +1261,8 @@ header_end <= free_begin <= free_end
 free_end <= 固定ITL区域起点
 itl_count <= itl_capacity
 ```
+
+`directory_version` 固定为 32 bit。它是该顶点单个方向的目录结构发布号，目录链页面和 Adjacency Data Page 在挂接时复制它，读取时必须等于当前已发布的目录版本。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
 
 Packed模式在同类Slotted Page中保存小目录及其小邻接列表：
 
@@ -1425,7 +1427,7 @@ typedef struct st_graph_adj_data_page_header {
     uint32 live_count;
     uint32 flags;
     graph_adj_locator_t next_page;
-    uint32 directory_version;
+    uint32 directory_version;       /* 固定32 bit，等于已发布目录版本 */
     uint16 free_begin;
     uint16 free_end;
     uint8  itl_count;
@@ -1747,7 +1749,8 @@ owner_vid == 当前顶点VID
 direction == OUT
 edge_type_id == CLICKED
 schema_layout_id可读
-directory_version和root generation匹配
+directory_version等于当前已发布目录版本
+root locator generation匹配
 ```
 
 扫描Entry时：
@@ -2292,6 +2295,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
 - Adjacency Directory Header按身份、统计、空间和页链分组，48B自然对齐且前2B兼容前缀不变；
+- `directory_version` 在目录页和邻接数据页都固定为32 bit；16 bit回绕不得被当作当前目录，旧引用未退出时禁止复用；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
 - Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
 - Directory/Adjacency Side Slot整理不改变object_slot和generation；
@@ -2335,6 +2339,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
 | Phase 1邻接页持久化Zone Map、Bloom和失效掩码 | 56B Header只保留 `free_begin/free_end`；摘要延后到Format V2 | 8KB页面直接扫描成本较低，避免未经基准验证的摘要维护、删除重建和MVCC复杂度 |
 | Directory Header按对齐空隙穿插字段 | 48B Header按身份、统计、空间和页链分组 | 保持自然4B对齐，同时让相关字段连续、偏移稳定 |
+| `directory_version` 缩为16 bit | 目录页和邻接数据页都固定使用32 bit | 16 bit回绕会把旧目录页误认为当前目录，造成邻居重复、丢失或写入旧页面 |
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 
 ## 25. 总体确认清单
