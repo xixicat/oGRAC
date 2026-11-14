@@ -171,9 +171,13 @@ OpenCypher 前端
 |---|---|---|
 | `STATEMENT` | 查询开始前已提交的数据对该语句可见，默认 | 使用查询 SCN，必要时构造 CR |
 | `TRANSACTION` | 整个事务使用同一个快照 SCN | 所有跳使用事务 SCN 和 CR |
-| `EVENTUAL` | 允许读取本地已缓存的旧版本 | 优先本地副本，后台刷新 |
+| `EVENTUAL` | 同一语句仍使用一个快照 SCN，但这个 SCN 可以落后于集群最新 SCN | 使用本节点已经应用的关闭 SCN |
 
-一次图遍历中的所有页面使用同一个查询 SCN。最终一致模式显式放宽该要求。
+一次图遍历中的所有页面使用同一个查询 SCN。`STATEMENT` 和 `TRANSACTION` 取集群已经提交的 SCN。`EVENTUAL` 不改成每页各读各的缓存版本，否则一次多跳遍历会把不同时刻的边拼在一起。
+
+`EVENTUAL` 采用和 CockroachDB follower read、Oracle Active Data Guard 只读快照相同的做法：选择本节点本地已关闭、已应用的 SCN，整条语句都按这个 SCN 构造 CR。Neo4j Causal Cluster 的 READ_REPLICA 也是读一个可能落后的已提交点，而不是读未提交页面。Cassandra 的 ONE 会把不同副本上的不同写入拼进同一次读，图遍历不采用这种语义。
+
+本会话若刚提交过写入，`EVENTUAL` 至少提升到该提交 SCN，保证读到自己的写。`current_scn - local_scn` 超过 Catalog 中的 `max_staleness_scn` 时，本次语句改为向写节点取 `STATEMENT` 快照。允许落后多少由基准测试决定，语句内部只有一个 SCN 这条规则不变。
 
 ### 4.2 第一期一写多读
 
@@ -193,7 +197,7 @@ OpenCypher 前端
 节点 2：Placement Partition C
 ```
 
-不同节点写不同页面集合。DRC 仍拒绝两个节点同时持有同一页的 X 权限。跨分区边在同一事务中按分区编号顺序更新，降低死锁概率。
+不同节点写不同页面集合。DRC 仍拒绝两个节点同时持有同一页的 X 权限。跨分区边和同分区边使用同一条加锁规则：数据页按物理 `page_id` 升序获取 X Latch，规则见第 16.5 节。分区号不参与排序，否则 A→B 与 B→A 仍会交叉等待。
 
 跨分区原子提交继续使用 oGRAC 事务、Undo 和 Redo。第一期不引入新的分布式提交协议。
 
@@ -214,7 +218,7 @@ OpenCypher 前端
 ```text
 VID
  → Virtual Partition
- → Segment 与Radix Page Map
+ → Segment Extent Map
  → page_id
  → DRC Partition
  → Page Owner
@@ -261,6 +265,15 @@ virtual_partition_id =
 
 广告场景可以按租户、广告主、地域或稳定业务主键组合分区。具体键和分区数量通过边切割率测试确定，编码容量预留 65536 个 Virtual Partition。
 
+Virtual Partition 一旦写入 VID 就不再改变，因此不能使用会随节点数变化的一致性哈希。业界固定槽位的做法是 Redis Cluster 的 16384 个 hash slot，以及 NebulaGraph 的 `hash(vid) % partition`：逻辑分区数量固定，迁移的是分区到机器的归属。CockroachDB 和 TiKV 则把连续 key range 作为搬迁单位。图这里把两者合成连续区间：
+
+```text
+vps_per_placement = virtual_partition_count / placement_partition_count
+placement_id      = virtual_partition_id / vps_per_placement
+```
+
+两个数量在创建图时都取 2 的幂，除法是移位。默认 65536 个 Virtual Partition、1024 个 Placement 时，每个 Placement 连续覆盖 64 个 Virtual Partition。`SYS_GRAPH_PLACEMENT` 保存区间 `[vp_start, vp_end]`、Preferred Instance、`route_epoch` 和 `ONLINE/MIGRATING`，不为每个 Virtual Partition 存一行。在线平衡按整个区间搬迁，和 Redis 搬 slot 范围、CockroachDB 搬 range 一样；VID 里的 Virtual Partition 不变。
+
 ## 6. 标识体系
 
 ### 6.1 VID 与 EID
@@ -297,13 +310,18 @@ EID 同样使用 64 bit，但中间 32 bit 是物理无关的 Edge Location：
 +-----------------------+------------------------+----------+--------------------+
 ```
 
-`logical_page_no` 定位 Virtual Partition 的 Edge Segment 中的逻辑页，`slot_id` 定位该页中的固定槽。8KB 页面中最小 Canonical Edge Slot 是 40B，单页不会超过 256 个槽，因此 8-bit `slot_id` 足够。
+`logical_page_no` 定位 Virtual Partition 的 Edge Segment 中的逻辑页，`slot_id` 定位该页中的固定槽。8KB 页面中最小 Canonical Edge Slot 是 40B，单页自然不超过 256 个槽。数据库页可以是 8KB、16KB 或 32KB，更大页面也必须把 `slots_per_page` 限制为 256，剩余空间留空，因此 8-bit `slot_id` 足够。
+
+```c
+typedef uint64 graph_vid_t; /* 16+32+16，见上文布局 */
+typedef uint64 graph_eid_t; /* 16+24+8+16，见上文布局 */
+```
 
 24-bit `logical_page_no` 可表示 16,777,216 个 Edge Page，即每个 Virtual Partition 约 128GiB 的原始页面地址空间。扣除页头、PCR ITL 和分配 Bitmap 后，按 40B–64B Slot 估算，单个 Virtual Partition 可保存约 17 亿–31 亿条 Canonical Edge。百亿条边即使只使用 1,024 个 Virtual Partition，平均每分区也只有约 977 万条边，第一期余量充足。
 
 不从 generation 借位扩大页号。generation 用于阻止 Slot 复用后的陈旧 EID 命中新边，缩短为 8 bit 或 12 bit 会显著增加高频增删场景的回绕风险。Catalog 预留 `eid_layout_version`；若未来明确要求单个 Virtual Partition 超过上述容量，可以增加 `VP12_PAGE28_GEN16` 或更宽 EID，而不是静默改变现有编码。
 
-Edge Slot删除后再次分配时 generation递增；generation即将回绕时该Slot永久退休。第一期中，一个已经分配的 `logical_page_no` 永久绑定其Edge Type、Schema Layout、Slot宽度和逻辑页身份：即使所有Slot都已删除，也不能把该逻辑页号重新格式化或重新分配给另一种Layout。允许在保持全部Slot字节、generation、页面身份和Layout不变的前提下，把该逻辑页物理搬迁到新 `page_id`，并原子递增 `map_epoch`。这样旧EID不会因为页面重格式化而按新的 `slot_size` 命中另一条边。系统在逻辑页号使用率达到75%时告警；回收该限制需要未来EID格式增加页面代次，不能复用当前Slot generation。
+Edge Slot删除后再次分配时 generation递增；generation即将回绕时该Slot永久退休。第一期中，一个已经分配的 `logical_page_no` 永久绑定其Edge Type、Schema Layout、Slot宽度和逻辑页身份：即使所有Slot都已删除，也不能把该逻辑页号重新格式化或重新分配给另一种Layout。允许在保持全部Slot字节、generation、页面身份和Layout不变的前提下搬迁整个Extent，并原子递增 `extent_epoch`。这样旧EID不会因为页面重格式化而按新的 `slot_size` 命中另一条边。系统在逻辑页号使用率达到75%时告警；回收该限制需要未来EID格式增加页面代次，不能复用当前Slot generation。
 
 ### 6.2 External ID
 
@@ -316,6 +334,8 @@ Edge Slot删除后再次分配时 generation递增；generation即将回绕时�
 使用 ID Namespace 而不是 Label，因为一个顶点的 Label 可以增减，业务身份保持不变。
 
 创建顶点时，ID Map、Vertex Slot 和属性记录在同一事务提交。首次查询通过 ID Map 得到 VID；后续遍历直接使用 VID。
+
+ID Map 复用现有 PCR B-tree，不新增页面类型。键是 `(graph_id, id_namespace_id, external_id)`，值是 VID。Label 倒排同样复用 PCR B-tree，键是 `(graph_id, label_id, virtual_partition_id, vid)`。
 
 ### 6.3 三种地址
 
@@ -373,12 +393,15 @@ Phase 1不在 `05` 中物理分配编号 `11`–`13`。它们只保留为未来�
 
 ```text
 PAGE_TYPE_GRAPH_SEG_HEAD
-PAGE_TYPE_GRAPH_SEG_MAP
+PAGE_TYPE_GRAPH_EXTENT_MAP
 PAGE_TYPE_GRAPH_VERTEX
 PAGE_TYPE_GRAPH_EDGE
 PAGE_TYPE_GRAPH_ADJ_DIR
 PAGE_TYPE_GRAPH_ADJ_DATA
+PAGE_TYPE_GRAPH_FREE_DIR
 ```
+
+`PAGE_TYPE_GRAPH_FREE_DIR` 只出现在 Edge Segment 中，保存按 Schema Layout 分组的空闲边页号。属性行不使用新的页面类型，继续使用 `PAGE_TYPE_PCRH_DATA`。
 
 属性页复用 `PAGE_TYPE_PCRH_DATA` 和 LOB。所有结构使用显式字节布局和编译期尺寸断言，不使用依赖编译器的位域。
 
@@ -414,39 +437,56 @@ slot_area_offset = align8(上述固定头、ITL和Bitmap区域)
 
 `itl_capacity`、`slot_area_offset`、`slot_size` 和 `slots_per_page` 在页面生命周期内不可改变。ITL耗尽时等待或复用已清理ITL，不能扩展固定ITL区域。
 
+格式化时的默认 ITL 容量按页面并发而不是按槽宽估计。顶点页和边页上会有不同事务同时修改不同槽，目录页通常只跟着一个顶点的结构变更，邻接数据页在超级节点上更热，映射页和空闲目录由分配路径串行：
+
+| 页面 | 默认 `itl_capacity` | 8KB、默认槽宽下的槽数 |
+|---|---:|---:|
+| Vertex Page | 8 | 48B 槽为 164，64B 槽为 123 |
+| Edge Page | 8 | 40B 槽为 196；结果若超过 256 则截断为 256 |
+| Adjacency Directory | 4 | 变长对象，不按固定槽计算 |
+| Adjacency Data | 16 | 变长对象 |
+| Free Directory | 2 | 索引项或页号栈 |
+| Extent Map、Segment Head | 2 | 无数据槽 |
+
+8KB 顶点页在 8 个 ITL 下，页头、24B 身份、24B 顶点头、192B ITL 和页尾先占用 280B，再留 Bitmap 并对齐，48B 槽得到 164 个。把 ITL 从 4 提到 8 只减少约 2 个槽，但同一页上的并发更新不必互相等待同一个 ITL。16KB 和 32KB 仍使用上表容量；边页即使算出超过 256 个槽，也保持 `slots_per_page <= 256`。
+
 ### 7.2 `01 Graph Partition / Segment Map`
 
 每个 `(graph_id, virtual_partition_id, segment_kind)` 有独立逻辑Segment。第一期Segment Kind为：
 
 ```text
-GRAPH_SEG_VERTEX
-GRAPH_SEG_EDGE
-GRAPH_SEG_ADJ_DIRECTORY
-GRAPH_SEG_ADJ_DATA
+1 GRAPH_SEG_VERTEX
+2 GRAPH_SEG_EDGE
+3 GRAPH_SEG_ADJ_DIRECTORY
+4 GRAPH_SEG_ADJ_DATA
 ```
 
-Map Root和Map内部Child都必须携带期望的Epoch与Generation，不能只保存Physical Page ID：
+0 非法。公共 Identity 的 `segment_kind` 使用这组编号。
+
+图 Segment 复用现有表空间的 Entry 登记，不另做一套 Extent 分配器。创建时由 Space Manager 分配 Entry Page，页类型为 `PAGE_TYPE_GRAPH_SEG_HEAD`，再把 `tablespace_id` 和 `page_id_t entry` 写入 `SYS_GRAPH_SEGMENT`。这和堆表 `db_update_table_entry`、索引 `db_update_index_entry`、LOB `db_update_lob_entry` 的登记方式相同。以后的物理 Extent 仍挂在该 Entry 的 `page_head_t.next_ext` 上。Graph Extent Map 只把逻辑页翻译到这些已经分配的物理 Extent，不代替表空间分配和数据文件高水位。
+
+Extent Map页的Root和Child都必须携带期望的Epoch与Generation，不能只保存Physical Page ID：
 
 ```c
-typedef struct st_graph_map_page_ref {
+typedef struct st_graph_mapping_page_ref {
     pagid_data_t physical_page_id;  /* 6B */
     uint16 flags;
-    uint32 map_epoch;
+    uint32 ref_epoch;
     uint16 page_generation;
     uint16 reserved_zero;
-} graph_map_page_ref_t;             /* 16B */
+} graph_mapping_page_ref_t;         /* 16B */
 ```
 
-Segment Head的Graph扩展部分为56B：
+每个Segment选择固定的Logical Extent大小，默认128页且必须是2的幂。Segment Head的Graph扩展部分为60B：
 
 ```c
 typedef struct st_graph_segment_head {
+    uint8  segment_format_version;  /* V1=1 */
+    uint8  header_bytes;            /* V1=60 */
+    uint16 virtual_partition_id;
     uint32 graph_id;
     uint32 segment_id;
-    uint16 virtual_partition_id;
-    uint8  segment_kind;
-    uint8  format_version;
-    graph_map_page_ref_t map_root;
+    graph_mapping_page_ref_t extent_map_root;
     uint32 next_logical_page_no;
     uint32 allocated_page_count;
     uint32 retired_page_count;
@@ -455,92 +495,215 @@ typedef struct st_graph_segment_head {
     uint16 default_slots_per_page;
     uint16 fixed_itl_capacity;
     uint16 flags;
+    uint16 logical_extent_pages;     /* default 128 */
+    uint16 reserved_zero;
     uint32 free_layout_directory;
-} graph_segment_head_t;             /* 56B */
+} graph_segment_head_t;             /* 60B */
 ```
 
-逻辑页到物理页不使用巨大的平坦数组，而使用持久化Radix-256 Map。叶子项为16B：
+Segment Head 字段的用途：
+
+- `next_logical_page_no` 是下一个可分配的逻辑页号。Edge Segment 不得分配超过 `0xFFFFFF` 的页号，因为 EID 只有 24 bit 页号。
+- `allocated_page_count` 统计已经交给 Extent Map 的逻辑页，`retired_page_count` 统计永久退休、不能重新格式化的逻辑页。
+- `route_epoch` 是该分区 Segment 的路由代次。在线改变 Preferred Instance 时递增，旧请求带着旧代次结束，新请求读取新的 Catalog 路由。
+- `default_slot_size`、`default_slots_per_page` 和 `fixed_itl_capacity` 只用于槽宽固定的 Vertex Segment，并复制到每张 Vertex Page。Edge Segment 的槽宽按页面 Layout 决定，这三个字段写 0。
+- `free_layout_directory` 是 Edge Segment 按 `schema_layout_id` 查找空闲页链的目录根逻辑页号。Vertex、Directory 和 Adjacency Data Segment 写 0。
+- `flags` 在 V1 没有已分配的位，必须写 0；读到非 0 视为损坏。
+
+`graph_mapping_page_ref_t.flags` 和 Extent Map Header 的 `flags` 同样在 V1 必须为 0。引用是否有效由 `ref_epoch`、`page_generation` 和 Entry 的 `PRESENT/RETIRED` 判断。
+
+主路径使用Extent Map。每个20B Entry把一个Logical Extent映射到一个连续Physical Extent：
 
 ```c
-typedef struct st_graph_page_map_entry {
-    pagid_data_t physical_page_id;  /* 6B */
-    uint16 flags;                   /* PRESENT/RETIRED/MOVING */
-    uint32 map_epoch;
-    uint16 page_generation;
-    uint16 layout_id;
-} graph_page_map_entry_t;           /* 16B */
+typedef struct st_graph_extent_map_entry {
+    pagid_data_t physical_first_page; /* 6B */
+    uint16 page_count;
+    uint32 extent_epoch;
+    uint32 mapping_version;
+    uint16 allocation_generation;
+    uint16 flags;                   /* PRESENT/RETIRED */
+} graph_extent_map_entry_t;         /* 20B */
 ```
 
-`PAGE_TYPE_GRAPH_SEG_MAP` 的Map扩展头和内部Child Entry为：
+`allocation_generation` 在Physical Extent每次被空间分配器重新分配时递增，并与表空间分配记录及DRC Extent映射资源身份比较，用于阻止旧Extent映射ABA；它不能替代其中每个Logical Page的 `page_generation`。纯物理搬迁必须保留所有Logical Page的Page Generation。
+
+`MAPPING_BUSY` 仅是Logical Extent Mapping X Guard保护下的易失运行态，不写入持久化Entry，避免Crash留下永久阻塞状态。
+
+`PAGE_TYPE_GRAPH_EXTENT_MAP` 每张Leaf保存256个Extent Entry。普通Segment使用Chunked Extent Array；超过单层容量或Logical Extent空间稀疏时，`level>0` 页面使用256个Child Reference按Logical Extent Number组织：
 
 ```c
-typedef struct st_graph_page_map_header {
+typedef struct st_graph_extent_map_header {
+    uint8  extent_map_format_version; /* V1=1 */
+    uint8  header_bytes;              /* V1=24 */
+    uint8  level;                     /* 0=256个Extent Entry */
+    uint8  reserved_zero;
     uint32 graph_id;
     uint32 segment_id;
-    uint32 base_logical_page_no;
-    uint16 virtual_partition_id;
-    uint8  segment_kind;
-    uint8  level;                    /* 0=leaf */
+    uint32 base_logical_extent_no;
     uint16 entry_count;
     uint16 flags;
-    uint32 reserved_zero;
-} graph_page_map_header_t;           /* 24B */
+    uint32 chunk_epoch;
+} graph_extent_map_header_t;        /* 24B */
 
-typedef graph_map_page_ref_t graph_page_map_child_t; /* 16B */
+typedef graph_mapping_page_ref_t graph_extent_map_child_t; /* 16B */
 ```
 
-每层固定Fanout 256。内部页保存256个Child Entry，Leaf保存256个 `graph_page_map_entry_t`；`base_logical_page_no` 必须按当前层覆盖范围对齐。Map Page使用 `page_head_t + graph_page_identity_t + graph_page_map_header_t + entries + page_tail_t`，通过 `map_root` 和Child Physical Page ID访问，不再递归映射。每次读取都校验Reference中的 `map_epoch/page_generation`；物理搬迁Map Page时原子更新父Reference，旧物理页只有在旧引用不再可见后才能复用。
+Extent Map每层固定Fanout 256。Level 0覆盖256个Logical Extent，Level L覆盖 `256^(L+1)` 个Logical Extent；覆盖范围和Base对齐使用64-bit Checked Arithmetic，避免32-bit Root计算溢出。`base_logical_extent_no` 必须按本层覆盖范围对齐，分支下标按Logical Extent Number对应层的8-bit数字计算。
 
-Segment Head与Map Page的公共身份规则为：
+正常页面定位：
+
+```text
+logical_extent_no = logical_page_no / logical_extent_pages
+page_offset       = logical_page_no % logical_extent_pages
+extent_entry      = lookup_extent(logical_extent_no)
+physical_page_id  = extent_entry.physical_first_page + page_offset
+```
+
+最终解析顺序固定为：
+
+```text
+1. 获取Logical Extent的Mapping Read Guard
+2. 根据logical_extent_no读取Extent Entry并校验：
+      PRESENT=1，RETIRED=0
+      page_offset < page_count <= logical_extent_pages
+      allocation_generation匹配表空间分配记录及DRC Extent资源身份
+3. 使用Checked Page-ID Addition计算physical_first_page + page_offset，
+   Physical Extent不得跨Datafile边界
+4. 将physical page_id交给DRC定位Page Owner并Pin Buffer
+5. 校验Page Identity.mapping_epoch == Extent Entry.extent_epoch
+6. 复读Guard保护下的Extent Entry.mapping_version
+7. 释放Mapping Read Guard；Buffer Pin继续保护物理页
+```
+
+如果步骤5或6发现身份或版本不匹配，必须Unpin已进入的Buffer、丢弃对应Extent翻译缓存、释放Guard并从步骤1重新解析；禁止返回旧Resolution。
+
+Extent Cache Key是 `(graph_id, vpart, segment_kind, logical_extent_no)`，Cache Entry必须同时携带并匹配当前 `mapping_version` 和 `allocation_generation`；DRC Extent映射资源也携带相同Allocation Generation。普通热路径只执行一次Extent Cache查询、代次比较和页内偏移加法。
+
+每个Logical Extent有集群级Mapping S/X Guard，可复用DRC的新映射资源类型：
+
+- Reader持有S Guard直到完成映射解析、Buffer Pin和Page Identity复验；
+- Writer持有S Guard直到取得页面DRC X和Page Latch、再次校验mapping_version、完成页面修改并生成Redo；
+- Publisher持有X Guard完成最终复制、WAL持久化、缓存失效确认和映射发布；
+- X Guard阻止新的Reader取得旧版本，并等待已存在的S Guard退出；
+- `graph_page_resolve()` 必须返回或持有Guard，不能只返回一个可能立即过期的Physical Page ID。
+
+Per-Extent Guard只串行化同一Logical Extent，不能代替共享Extent Map页的并发控制。固定Entry更新必须取得Leaf Page DRC X/Page Latch。`graph_mapping_page_ref_t.ref_epoch` 必须等于所引用Extent Map节点的 `chunk_epoch`。
+
+Extent级Radix增长固定使用完整修改路径Copy-on-Write：从待修改Leaf到Root的所有路径节点都创建不可达副本，副本内的Child Reference从下到上组装；每个新节点递增 `chunk_epoch`，其Parent中的新Reference同步设置 `ref_epoch`。不得原地CAS已发布Parent的Child Reference。WAL发布顺序固定为“全部新路径节点内容与Redo持久化 → 以完整旧Root Reference元组 `(physical_page_id, ref_epoch, page_generation)` 对Segment Head中的Root执行唯一CAS → Commit/Flush”。恢复时只允许旧Root完整可达或新Root及其全部子节点完整可达，不能出现已发布Parent指向未持久化Child。Root CAS失败时丢弃整条未发布新路径并从Root重试；CAS失败或Crash时未被已提交Root引用的新节点作为孤儿空间回收。
+
+整Extent搬迁流程：
+
+```text
+获取Logical Extent Mapping X Guard，进入易失的MAPPING_BUSY状态
+ → 按Logical Page顺序获取所有源页DRC X与Page Latch，冻结写入
+ → 复制到连续的新Physical Extent
+ → 保留每页page_generation，写入新的extent_epoch
+ → 校验页面身份与Checksum
+ → 先持久化新页面Redo/数据，再写映射发布Redo
+ → 原子发布新Extent Entry：
+      mapping_version递增
+ → 广播并等待Extent翻译缓存失效确认
+ → 失效旧DRC资源后释放写冻结和Mapping X Guard
+ → 等待旧Buffer Pin、DCS传输和延迟响应结束
+ → 回收旧Extent
+```
+
+映射切换对查询SCN透明，不创建两个逻辑版本；发布前旧映射有效，发布后新映射有效。复制期间禁止未捕获的并发写；第一期使用上述阻塞式X Guard和Page Latch，后续才考虑Redo Catch-up或Dual Write。映射变更按Logical Extent串行化；实现也可以对预期 `mapping_version` 使用CAS，失败后重新解析并重试。
+
+WAL顺序必须保证“新页面内容 → 新映射元数据 → Commit/Flush”。恢复后只能得到完整旧映射或完整新映射；未发布的新Extent作为孤儿空间回收。
+
+旧Physical Page复用前必须完成DRC失效确认、DCS传输结束、Buffer Pin归零、Mapping Read Guard退出以及延迟响应隔离。仅依赖Page Identity不构成ABA屏障。
+
+`extent_epoch`、`ref_epoch`、`mapping_version` 和 `chunk_epoch` 不得在陈旧引用仍可能存在时回绕复用。接近回绕时执行集群映射缓存与DRC全局静默并推进Allocation/Page Generation；无法证明安全时退休对应映射身份。
+
+第一期Graph坏页修复复用oGRAC现有ABR的页面获取、Redo回放和原位写回机制，不改变Graph逻辑到物理映射。现有ABR只校验通用PCN、Page ID或Checksum，Graph Page接入时必须增加写回前身份校验：
+
+```text
+Standby ABR：
+  修复后的页面字节 → 原Buffer及原page_id
+  → 写回原Datafile的原Page Offset
+
+Backup + Redo ABR：
+  从Backup取得同一page_id
+  → 应用Redo到最新状态
+  → RESTORE FLUSHPAGE写回原file/page offset
+```
+
+ABR请求上下文按Page Type取得期望身份：
+
+- Vertex、Edge、Adjacency数据页：从受Mapping Read Guard保护的Extent Entry和Logical Page Offset取得；
+- Segment Head：从Catalog中的Segment入口取得；
+- Root Extent Map页：从Segment Head的 `extent_map_root` 取得；
+- Child Extent Map页：从受保护的Parent Reference取得。
+
+上下文必须包含期望的Page ID、Page Type，以及适用于该页的Graph、Segment、Virtual Partition、Segment Kind、Logical Page/Base、Mapping Epoch、Page Generation和Radix Level。Identity Version和Page Type Format Version不要求由Locator重复保存；ABR必须把修复页中的版本校验为当前集群兼容矩阵明确支持的组合，并按该组合注册的Header长度解析，禁止由损坏页自行定义长度。接收或Redo完成后，必须先校验修复页的Page ID、Graph Page Identity、Page Type、版本支持状态、对应类型Header和PCN，再计算/验证Checksum；任一项不匹配都必须中止，禁止重算Checksum后写回。原位写回成功后再次校验Buffer中的Graph Page Identity和Checksum。
+
+若原位置永久不可写，由存储层完成坏块重映射，或由数据库执行上述整Extent搬迁；第一期不提供Graph单页映射覆盖。Catalog仅预留 `GRAPH_MAP_FEATURE_PAGE_EXCEPTION` 格式特性位，第一期始终关闭且不分配对应Page Type或持久化结构；未来启用必须增加Mapping Format Version并提供迁移流程。
+
+Segment Head与映射元数据页的公共身份规则为：
 
 ```text
 Segment Head：
   logical_page_no    = UINT32_MAX
-  map_epoch          = 0
+  mapping_epoch      = 0
   page_generation    = 1
-  page_layout_version= Segment Format Version
+  segment_format_version = Segment Head格式版本
 
-Map Page：
-  logical_page_no    = base_logical_page_no
-  map_epoch          = Parent Reference.map_epoch
+Extent Map Page：
+  logical_page_no    = base_logical_extent_no
+  mapping_epoch      = Parent Reference.ref_epoch
   page_generation    = Parent Reference.page_generation
-  page_layout_version= Radix level
+  extent_map_format_version = Extent Map格式版本
+  level              = Extent Radix层级
 ```
 
-Map Page首次分配generation为1；同一物理页回收并用于新的Map Page身份时递增generation，回绕前退休。读取Map Page同时校验 `base_logical_page_no + level + segment_id`，因此不同层级或覆盖范围不能互相替代。
+映射元数据页首次分配generation为1；同一物理页回收并用于新的映射页身份时递增generation，回绕前退休。读取时同时校验Base、Level和Segment ID，因此不同层级或覆盖范围不能互相替代。
 
-Map Key是：
+数据页映射Key是：
 
 ```text
-(graph_id, virtual_partition_id, segment_kind, logical_page_no)
+(graph_id, virtual_partition_id, segment_kind, logical_extent_no)
 ```
 
-Map更新与页面分配使用同一事务和Redo。读取物理页后必须反向校验页中的Graph、Segment、Virtual Partition、Logical Page、Page Epoch和Page Generation。Vertex Logical Page使用32 bit；Edge EID只允许24-bit Logical Page；Adjacency Locator使用32-bit Logical Page。
+Extent Map更新与页面分配使用同一事务和Redo。读取物理页后必须反向校验Graph、Segment、Virtual Partition、Logical Page和Extent Epoch。Page Generation由Adjacency Root Locator等上层对象身份校验，不能与 `allocation_generation` 混用。Vertex Logical Page使用32 bit；Edge EID只允许24-bit Logical Page；Adjacency Locator使用32-bit Logical Page。
 
 ### 7.3 Graph页面公共身份
 
-每张Graph页面在现有 `page_head_t` 后保存32B公共身份：
+每张原生Graph页面在现有 `page_head_t` 后保存24B公共身份。公共Identity只管理Graph身份格式；Vertex、Edge、Segment、Extent Map和Adjacency等具体页面格式分别由各自类型Header管理：
 
 ```c
 typedef struct st_graph_page_identity {
+    uint8  identity_version;        /* V1=1 */
+    uint8  identity_bytes;          /* V1=24 */
+    uint8  segment_kind;
+    uint8  reserved_zero;
     uint32 graph_id;
     uint32 segment_id;
     uint32 logical_page_no;
-    uint32 map_epoch;
+    uint32 mapping_epoch;
     uint16 virtual_partition_id;
-    uint16 page_layout_version;
     uint16 page_generation;
-    uint16 header_bytes;
-    uint8  segment_kind;
-    uint8  flags;
-    uint16 reserved_zero;
-    uint32 identity_crc;
-} graph_page_identity_t;            /* 32B */
+} graph_page_identity_t;            /* 24B */
 ```
 
-`page_generation` 保护页级Root Locator；`map_epoch` 防止读取到迁移前的物理映射；`identity_crc` 计算时把自身字段置零，只覆盖其余Graph身份和类型扩展头。整页Checksum仍由现有Page Tail提供。
+兼容前缀的前4B位置和语义永久不变。V1要求 `identity_version=1`、`identity_bytes=24`；未来Identity版本只能在24B之后追加4B对齐字段，不能重排V1字段。读取器先校验 `identity_version`，再以 `identity_bytes` 定位Page Type Header；未知Identity版本必须拒绝，不能猜测解析。`identity_bytes` 必须不小于24、不超过252且为4的倍数。滚动升级期间，在所有节点支持新Identity版本前不得写入该版本。
 
-Adjacency/Directory Logical Page第一次格式化时 `page_generation=1`。同一Logical Page回收后重新承担新的Root身份时递增Page Generation；纯物理搬迁保持Page Generation不变、只递增Map Epoch。Page Generation即将回绕时永久退休该Logical Page。
+`page_generation` 保护页级Root Locator。数据页的 `mapping_epoch` 取Extent Entry的 `extent_epoch`，防止读取到搬迁前的物理映射；Segment Head固定为0，Extent Map页取Parent Reference的 `ref_epoch`。公共Identity不再保存 `page_layout_version`、通用 `header_bytes`、通用Flags或独立CRC；具体格式版本和Header长度属于各Page Type Header，完整性由现有整页Checksum保护。
+
+所有原生Graph Page Type Header都以固定2B兼容前缀开始：
+
+```text
+uint8 <page_type>_format_version   /* 0非法，V1=1，1–254正式版本，255保留 */
+uint8 header_bytes                 /* 包含该Page Type Header自身，不含公共Identity */
+```
+
+每个受支持的Page Type Format Version都在兼容矩阵中注册唯一的精确 `header_bytes`；读取时要求Header长度等于该注册值、为4的倍数，并且不超过扣除 `page_head_t`、公共Identity和 `page_tail_t` 后的页面剩余空间。同一Format Version不得改变Header长度或字段语义。未来版本只能在V1 Header末尾追加字段，同时递增Format Version和 `header_bytes`；支持该新版本的读取器可以用长度跳过自己不消费但已注册的扩展字段，旧读取器必须因未知版本拒绝，不能仅凭长度继续解析。
+
+每个Page Type独立递增自己的8-bit格式版本，版本不回绕、不复用；0非法，1–254为正式版本，255保留。`identity_version` 变化不强迫所有Page Type升级，某个Page Type升级也不改变公共Identity版本。滚动升级期间，每个Identity或Page Type新版本都必须先进入集群兼容矩阵，只有所有可能读取、恢复或接管该页的节点均声明支持后才允许写入。Extent Map的 `level`、Edge/Adjacency的 `schema_layout_id` 与格式版本分别表达树层级、业务Schema和物理编码，禁止混用。
+
+本文定义的是尚未落盘的初始V1 ABI；此前文档中的32B无版本Identity只是设计草案，不属于可读取的V0格式，也不提供原位兼容。如果已有实验数据按旧草案写盘，必须离线重建或显式迁移，不能由V1读取器启发式识别。“新读取器读取旧版本”仅指未来V2及以后读取已正式落盘的V1页面。
+
+Adjacency/Directory Logical Page第一次格式化时 `page_generation=1`。第一期不把已回收的Adjacency/Directory Logical Page Number重新分配给新的页面身份，而是永久退休；Object Slot可以在原页面身份内通过自身generation复用。因此8B `graph_adj_locator_t` 不会发生“Page Generation和Object Generation同时回绕”的ABA。整Extent物理搬迁保持Page Generation不变、只递增Extent Epoch。
 
 ### 7.4 Locator分类
 
@@ -564,30 +727,61 @@ typedef struct st_graph_adj_locator {
 属性仍使用现有8B `rowid_t`，但Property Row必须反向校验Owner ID和generation。VID/EID Locator是运行时结构：
 
 ```c
+typedef struct st_graph_page_resolution {
+    page_id_t physical_page_id;
+    uint32 mapping_epoch;
+    uint32 mapping_version;
+    uint16 page_generation;
+    uint16 reserved_zero;
+} graph_page_resolution_t;         /* 20B */
+
 typedef struct st_graph_slot_location {
     page_id_t physical_page_id;
-    uint32 map_epoch;
+    uint32 mapping_epoch;
+    uint32 mapping_version;
     uint16 slot_id;
     uint16 slot_size;
-} graph_slot_location_t;            /* 16B */
+} graph_slot_location_t;            /* 20B */
 ```
 
-`27 VID Locator` 和 `28 EID Locator` 都使用该结构；它们只存在于Buffer/执行器上下文中。
+`27 VID Locator` 和 `28 EID Locator` 都使用该结构；它们只存在于Buffer/执行器上下文中。Mapping Guard是运行时不透明对象，不进入持久化结构。
+
+`graph_page_resolution_t.page_generation=0` 表示Extent映射层没有Page Generation期望值，调用方必须用VID/EID或Adjacency Root语义完成对象代次校验。
 
 ### 7.5 编号结构定义索引
 
 | 编号 | 具体定义 |
 |---|---|
-| 01 | `graph_segment_head_t`、`graph_page_map_header_t/child_t/entry_t` |
+| 01 | `graph_segment_head_t`及Extent Map结构 |
 | 02–04 | `graph_page_identity_t`、`graph_vertex_page_header_t`、固定ITL/Bitmap/Slot Array布局 |
 | 05–10 | 三种 `graph_vertex_slot_*_t`、`graph_vertex_meta_t`、`graph_adj_descriptor_t` |
 | 11–13 | Phase 1不持久化；仅保留未来图级Inline Edge格式 |
 | 14 | `graph_adj_dir_page_header_t`、`graph_adj_dir_entry_t`、Packed/Shard/Migration对象 |
 | 15–16 | `graph_adj_data_page_header_t`、`graph_adj_slot_t`、`graph_adj_entry_base_t`及方向Inline Payload |
-| 17–22 | `graph_edge_page_header_t`、四种 `graph_edge_slot_*_t`、`graph_edge_meta_t` |
-| 23–25 | 现有PCR Heap Page/Row加 `graph_property_row_header_t` |
+| 17–22 | `graph_edge_page_header_t`、四种 `graph_edge_slot_*_t`、`graph_edge_meta_t`、空闲目录 |
+| 23–25 | 普通 PCR Heap 表和系统列，不插入私有行前缀 |
 | 26 | 与02相同，由目标VID定位，不是新Page Type |
 | 27–28 | 运行时 `graph_slot_location_t`，不持久化 |
+
+### 7.6 Redo 与 Undo
+
+图页面使用新的日志区间 `LOG_TYPE_GRAPH = 200` 到 239。现有区间已经占用 Heap 35、Undo 70、B-tree 90、Lob 130、PCR Heap 150、PCR B-tree 180 和 Punch 240，固定槽修改不能复用 `RD_HEAP_*` 或 `RD_PCRH_*`。属性行和 ID Map、Label 倒排仍使用现有 PCR Heap 与 PCR B-tree 日志。
+
+第一期图日志为：
+
+| 记录 | 作用 |
+|---|---|
+| `RD_GRAPH_FORMAT_PAGE` | 格式化页头、固定 ITL、Bitmap 或空闲目录容量 |
+| `RD_GRAPH_ALLOC_SLOT` | 初始化槽或邻接对象，并置分配位 |
+| `RD_GRAPH_DELETE_MARK` | 写入删除状态，保留分配位 |
+| `RD_GRAPH_UPDATE_BYTES` | 覆盖槽、描述符、目录项或页头中的一段字节 |
+| `RD_GRAPH_SET_ADJ_ROOT` | 同时写入 Mode Nibble 和 Descriptor Root |
+| `RD_GRAPH_DIR_PUBLISH` | 写入 `directory_version` 和 `next_page` |
+| `RD_GRAPH_EXTENT_PUBLISH` | 写入新的 Extent Entry |
+| `RD_GRAPH_FREE_PUSH` / `RD_GRAPH_FREE_POP` | 压入或弹出空闲边页号 |
+| `RD_GRAPH_RECLAIM_SLOT` | 快照结束后清 Bitmap bit 并递减 `used_slots` |
+
+Undo 挂在该页 PCR ITL 上，保存被覆盖区域的前镜像，以及 Bitmap 字节和 `used_slots`、`free_hint`、`entry_count` 这些计数的旧值。回滚按 ITL 中的 Undo 指针恢复前镜像。CR 与 PCR Heap 相同：复制页面，对提交 SCN 晚于查询 SCN 的 ITL 应用 Undo。不把整页前镜像作为常规 Undo，只记录实际修改的字节范围。
 
 ## 8. 顶点存储
 
@@ -617,7 +811,7 @@ typedef struct st_graph_slot_location {
 typedef struct st_graph_vertex_meta {
     uint16 flags;
     uint16 generation;
-    uint32 label_set_id;
+    uint32 label_set_id;           /* bit31=0 常用Label位图；bit31=1 外部Label Set */
     uint16 schema_layout_id;
     uint16 inline_property_state_bitmap;
     uint8  itl_id;
@@ -637,12 +831,13 @@ bit 4  IN_ADJ_PRESENT
 bit 5  SUPERNODE
 bit 6  MIGRATING
 bit 7  FROZEN
-bit 8–15 reserved
+bit 8  RETIRED
+bit 9–15 reserved
 ```
 
 删除标记受MVCC保护，旧快照结束后才允许回收。读取VID时必须同时满足 `ALLOCATED`、非可见删除且 `VID.generation == vertex_meta.generation`。
 
-`label_set_id` 指向一组 Label。`schema_layout_id` 决定当前图级预算中的热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
+`label_set_id` 复用这 32 bit 保存多 Label，编码见第 15 节。`schema_layout_id` 决定当前图级预算中的热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
 
 ```text
 00：NULL或属性不存在
@@ -701,23 +896,19 @@ typedef struct st_graph_vertex_slot_0 {
 } graph_vertex_slot_0_t;            /* 48B */
 
 typedef struct st_graph_vertex_slot_8 {
-    graph_vertex_meta_t meta;       /* offset 0  */
-    uint8 inline_values[8];         /* offset 16 */
-    rowid_t property_rowid;         /* offset 24 */
-    graph_adj_descriptor_t out_adj; /* offset 32 */
-    graph_adj_descriptor_t in_adj;  /* offset 44 */
+    graph_vertex_slot_0_t base;     /* offset 0  */
+    uint8 inline_values[8];         /* offset 48 */
 } graph_vertex_slot_8_t;            /* 56B */
 
 typedef struct st_graph_vertex_slot_16 {
-    graph_vertex_meta_t meta;       /* offset 0  */
-    uint8 inline_values[16];        /* offset 16 */
-    rowid_t property_rowid;         /* offset 32 */
-    graph_adj_descriptor_t out_adj; /* offset 40 */
-    graph_adj_descriptor_t in_adj;  /* offset 52 */
+    graph_vertex_slot_0_t base;     /* offset 0  */
+    uint8 inline_values[16];        /* offset 48 */
 } graph_vertex_slot_16_t;           /* 64B */
 ```
 
-编译期必须断言三个结构的总大小和每个字段偏移。
+三个档位共享相同的48B公共前缀：Meta固定在offset 0、Property RowID固定在offset 16、OUT Descriptor固定在offset 24、IN Descriptor固定在offset 36；Inline Payload统一追加在offset 48。这样邻接遍历、属性行访问、MVCC和恢复代码不需要根据Vertex Inline档位切换公共字段偏移，并与Canonical Edge Slot的“公共前缀 + 尾部Inline Payload”布局一致。
+
+编译期必须断言三个结构的总大小、公共字段偏移以及Inline Payload起始偏移。
 
 ### 8.2 顶点页
 
@@ -737,6 +928,8 @@ page_tail_t
 
 ```c
 typedef struct st_graph_vertex_page_header {
+    uint8  vertex_format_version;   /* V1=1 */
+    uint8  header_bytes;            /* V1=24 */
     uint16 slot_size;               /* 48/56/64 */
     uint16 slots_per_page;
     uint16 used_slots;
@@ -748,18 +941,69 @@ typedef struct st_graph_vertex_page_header {
     uint8  itl_count;
     uint8  itl_capacity;
     uint16 flags;
-    uint32 reserved_zero;
+    uint16 reserved_zero;
 } graph_vertex_page_header_t;       /* 24B */
 ```
 
-Allocation Bitmap表示Slot是否已物理分配或仍被旧快照保留；可见性仍由Slot Meta和PCR MVCC决定。删除后的Slot只有在所有旧快照结束后才清除Bitmap并进入可复用状态。
+Vertex Allocation Bitmap固定放在预留PCR ITL数组之后、Vertex Slot Array之前，不是Header中的C数组。页面格式化时按以下公式持久化位置和长度：
+
+```text
+itl_offset =
+    sizeof(page_head_t)
+  + graph_page_identity_t.identity_bytes
+  + graph_vertex_page_header_t.header_bytes
+
+bitmap_offset =
+    itl_offset
+  + itl_capacity * sizeof(pcr_itl_t)
+
+bitmap_bytes =
+    ceil(slots_per_page / 8)
+
+slot_area_offset =
+    align8(bitmap_offset + bitmap_bytes)
+```
+
+Slot `n` 使用LSB-first位序：
+
+```text
+byte = bitmap[n >> 3]
+mask = 1U << (n & 7)
+
+(byte & mask) == 0  → 未分配，可复用
+(byte & mask) != 0  → 已分配，或删除后仍被旧快照保留
+```
+
+最后一个Bitmap字节中超出 `slots_per_page` 的尾部保留bit在格式化时写1，扫描器仍必须以 `slots_per_page` 为上界。`used_slots` 等于有效Slot范围内置位数，不包括尾部保留bit；它统计正在使用、等待安全回收和永久退休的物理Slot，不等于当前可见顶点数。
+
+`free_hint` 是Slot编号，只是可陈旧的扫描起点，不是空闲状态的权威来源。插入在Page Latch下从 `free_hint` 开始扫描Bitmap并最多回绕一次；找到Slot `n` 后，首次分配设置 `generation=1`，复用时要求旧generation小于 `UINT16_MAX` 并递增，然后初始化Slot、置位Bitmap和递增 `used_slots`。若递增后 `used_slots == slots_per_page`，Hint写 `UINT16_MAX`；否则写 `(n + 1) % slots_per_page`，允许暂时指向另一个已置位Slot。Hint指向已分配Slot不构成损坏，扫描器继续查找。
+
+Bitmap是物理分配依据；Vertex Meta、PCR ITL和Undo决定事务可见性。删除只先写MVCC删除状态。只有删除事务已提交且不会回滚、所有可能读取删除前版本的快照均结束、对应Undo不再需要该Slot后，后台清理才可以回收。
+
+安全回收必须在同一Page Latch和Redo原子单元中清除Bitmap bit、递减 `used_slots` 并设置 `free_hint = deleted_slot_id`（原Hint有效时可取二者较小值）。Slot中原generation继续保留，等待下次分配时递增。若被删除Slot的generation已经是 `UINT16_MAX`，则设置Vertex Meta `RETIRED`、永久保留Bitmap bit和 `used_slots`，不得把该Slot加入空闲候选。
+
+插入时的Slot初始化、Bitmap置位、`used_slots/free_hint`更新同样必须在一个Page Latch和Redo原子单元中，恢复后不得出现“bit已置位但Slot未初始化”。页面读取和恢复必须校验：
+
+```text
+itl_offset == sizeof(page_head_t) + identity_bytes + header_bytes
+itl_count <= itl_capacity
+bitmap_offset == itl_offset + itl_capacity * sizeof(pcr_itl_t)
+bitmap_bytes  == ceil(slots_per_page / 8)
+slot_area_offset == align8(bitmap_offset + bitmap_bytes)
+slot_area_offset + slots_per_page * slot_size <= page_size - sizeof(page_tail_t)
+尾部保留bit全部为1
+used_slots == popcount(bitmap[0 .. slots_per_page))
+used_slots == slots_per_page  → free_hint == UINT16_MAX
+used_slots < slots_per_page   → free_hint < slots_per_page
+RETIRED Slot的Bitmap bit必须为1且generation == UINT16_MAX
+```
 
 `04` 中的槽宽在图级别固定，因此：
 
 ```text
 logical_page = local_sequence / slots_per_page
 slot_id      = local_sequence % slots_per_page
-page_id      = graph_page_map_resolve(VERTEX, logical_page)
+page_id      = graph_page_resolve(VERTEX, logical_page)
 ```
 
 `slots_per_page` 由页面大小、页头、ITL 和图级槽宽计算，并写入 Graph Catalog、Segment Header 与 Page Header。Vertex Inline预算创建图后不可在线修改，因为改变槽宽会改变所有 `local_sequence` 对应的逻辑页和槽号；需要更大预算时必须重建图或执行未来提供的整图重写流程。
@@ -772,8 +1016,8 @@ page_id      = graph_page_map_resolve(VERTEX, logical_page)
 
 ```c
 typedef struct st_graph_inline_edge_ref {
-    graph_vid_t neighbor_vid;       /* 12 */
-    graph_edge_token_t edge_token;  /* 13，仅混合 Edge Type 使用 */
+    graph_vid_t neighbor_vid;       /* 编号12，8B */
+    uint64 edge_token;              /* 编号13，8B；仅混合 Edge Type 使用 */
     uint8 inline_properties[N];     /* 方向对应的 OUT 或 IN Inline Properties */
 } graph_inline_edge_ref_t;
 ```
@@ -829,6 +1073,35 @@ typedef struct st_graph_edge_meta {
 } graph_edge_meta_t;                /* 16B */
 ```
 
+Edge Meta `flags` 的持久化位定义为：
+
+```text
+bit 0  ALLOCATED
+bit 1  DELETED
+bit 2  RETIRED
+bit 3  HAS_PROPERTY_ROW
+bit 4  OUT_ADJ_COPY_PRESENT
+bit 5  IN_ADJ_COPY_PRESENT
+bit 6  TEMPORAL
+bit 7  HAS_VECTOR_REF
+bit 8  MIGRATING
+bit 9–15 reserved
+```
+
+`property_mode` 表示规范属性的存放位置：
+
+```text
+0 NONE             无属性负载，property_rowid 为 INVALID_ROWID
+1 CANONICAL_SLOT   只在 Edge Slot 的 Inline Value 中
+2 SLOT_AND_ROW     Inline Value 与 Property Row 同时存在
+3 PROPERTY_ROW     只在 Property Row 中
+4 LOB              Property Row 中保存 LOB Locator
+5 VECTOR_REF       Property Row 中保存向量引用
+6–255 非法
+```
+
+`validity_flags` 在 V1 没有独立语义，必须写 0。投影是否有效由 `inline_property_state_bitmap` 的两位状态决定；读到非 0 视为损坏。
+
 Canonical Edge Slot的共同前缀和物理偏移为：
 
 ```c
@@ -864,7 +1137,7 @@ graph_id
 + PAGE_TYPE_GRAPH_EDGE
 + edge_type_id
 + schema_layout_id
-+ page_layout_version
++ edge_format_version
 ```
 
 页面头持久化上述全部身份字段以及 `slot_size` 和 `slots_per_page`。同一页面中的所有Slot必须具有相同的Edge Type、Schema Layout和Slot宽度；页面清空后这些字段也不可改变。`edge_type_id` 虽然可以通过 `schema_layout_id` 查询，仍冗余保存在页头中，用于恢复、页面转储和损坏校验。
@@ -885,8 +1158,10 @@ page_tail_t
 
 ```c
 typedef struct st_graph_edge_page_header {
-    uint32 edge_type_id;
+    uint8  edge_format_version;     /* V1=1 */
+    uint8  header_bytes;            /* V1=32 */
     uint16 schema_layout_id;
+    uint32 edge_type_id;
     uint16 slot_size;               /* 40/48/56/64 */
     uint16 slots_per_page;          /* 必须 <= 256 */
     uint16 used_slots;
@@ -898,13 +1173,42 @@ typedef struct st_graph_edge_page_header {
     uint8  itl_count;
     uint8  itl_capacity;
     uint16 flags;
-    uint8  reserved_zero[6];
+    uint8  reserved_zero[4];
 } graph_edge_page_header_t;         /* 32B */
 ```
 
+Vertex Page Header 和 Edge Page Header 的 `flags` 在 V1 都没有已分配的位，必须写 0。页面状态由 Bitmap、`used_slots`、`free_hint` 和 Slot Meta 表达。
+
 EID的8-bit `slot_id` 允许0–255，页面格式化时必须验证 `slots_per_page <= 256`。Allocation Bitmap是Slot复用和恢复扫描的物理分配依据；边的查询可见性仍由Meta、ITL和Undo决定。
 
-每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Radix Page Map得到物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
+Edge Allocation Bitmap固定放在预留PCR ITL数组之后、Canonical Edge Slot Array之前：
+
+```text
+itl_offset =
+    sizeof(page_head_t)
+  + graph_page_identity_t.identity_bytes
+  + graph_edge_page_header_t.header_bytes
+
+bitmap_offset =
+    itl_offset
+  + itl_capacity * sizeof(pcr_itl_t)
+
+bitmap_bytes =
+    ceil(slots_per_page / 8)
+
+slot_area_offset =
+    align8(bitmap_offset + bitmap_bytes)
+```
+
+Edge Slot也使用 `bitmap[slot_id >> 3]` 和 `1U << (slot_id & 7)` 的LSB-first位序。0表示未分配，1表示已分配、等待安全回收或永久退休；最后一个字节超出 `slots_per_page` 的尾部保留bit初始化为1，且不计入 `used_slots`。`used_slots` 等于有效Slot范围内的置位数，不等于当前可见边数。
+
+`free_hint`只是可陈旧的扫描起点。插入在Page Latch下从Hint开始并最多回绕一次，以Bitmap找到Slot `n`；分配完成后，满页写 `UINT16_MAX`，否则写 `(n + 1) % slots_per_page`。首次分配generation为1，复用时递增且禁止从 `UINT16_MAX` 回绕。
+
+删除边时先保留Bitmap bit并依赖Edge Meta、ITL和Undo提供旧版本可见性。只有删除事务已提交且不会回滚、旧快照结束并且Undo不再需要该Slot后，才能在同一Page Latch和Redo原子单元中清bit、递减 `used_slots`、保留generation并降低Hint。generation已经为 `UINT16_MAX` 时设置Edge Meta `RETIRED`，保持bit和 `used_slots`不变并永久禁止复用。
+
+Edge Page读取和恢复必须执行与Vertex Page相同的精确Offset、长度、尾部bit、`used_slots/free_hint`和RETIRED校验，并额外验证 `slots_per_page <= 256`。Edge Slot初始化、Bitmap置位、计数和Hint更新也必须属于同一Page Latch和Redo原子单元。
+
+每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Extent Map计算物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
 
 ```text
 slot_address = slot_area + slot_id * slot_size
@@ -912,9 +1216,48 @@ slot_address = slot_area + slot_id * slot_size
 
 随后校验 Slot generation。这样不同Edge Type可以使用不同槽宽，同时保持EID直接定位。
 
+### 9.1 空闲边页目录
+
+`free_layout_directory` 是 Edge Segment 中第一张 `PAGE_TYPE_GRAPH_FREE_DIR` 索引页的逻辑页号。Vertex、Directory 和 Adjacency Data Segment 没有这类页面，字段写 0。空闲页号不写进 Edge Page Header，避免为了空闲链改变 32B 边页头。
+
+目录有两种角色，页头相同：
+
+```c
+typedef struct st_graph_free_dir_header {
+    uint8  free_dir_format_version; /* V1=1 */
+    uint8  header_bytes;            /* V1=32 */
+    uint8  page_role;               /* 1=INDEX，2=STACK */
+    uint8  flags;                   /* V1=0 */
+    uint32 graph_id;
+    uint32 segment_id;
+    uint16 schema_layout_id;        /* STACK 页；INDEX 页写 0 */
+    uint16 slot_size;               /* STACK 页；INDEX 页写 0 */
+    uint16 entry_count;
+    uint16 entry_capacity;
+    uint32 next_logical_page_no;    /* UINT32_MAX 表示链尾 */
+    uint8  itl_count;
+    uint8  itl_capacity;            /* 默认 2 */
+    uint16 reserved_zero;
+    uint32 reserved_zero2;
+} graph_free_dir_header_t;          /* 32B */
+```
+
+索引页的项指向某个 Layout 的页号栈：
+
+```c
+typedef struct st_graph_free_dir_index_entry {
+    uint16 schema_layout_id;
+    uint16 slot_size;
+    uint32 free_count;
+    uint32 head_logical_page_no;
+} graph_free_dir_index_entry_t;     /* 12B */
+```
+
+栈页的负载是 `uint32 logical_page_no[entry_capacity]`，只保存同一个 `schema_layout_id` 和 `slot_size`。`entry_count` 是栈顶。分配从栈顶弹出，释放压回栈顶；栈页满了就再分配一张栈页并更新索引项的 `head_logical_page_no`。弹出和压入与使用该边页的数据修改属于同一事务，Undo 按相反方向恢复栈顶。`entry_capacity` 在格式化时固定，数组不向 ITL 区域生长。
+
 规范边是属性事实来源。出邻接和入邻接中的属性是为遍历准备的副本。
 
-`flags` 表示已使用、已删除、存在属性行、存在出邻接副本、存在入邻接副本、时态边、关联向量和迁移状态。`property_mode` 表示属性位于规范槽、规范槽加属性行、仅属性行、LOB 或向量引用。
+`flags` 表示已使用、已删除、永久退休、存在属性行、存在出邻接副本、存在入邻接副本、时态边、关联向量和迁移状态。`property_mode` 表示属性位于规范槽、规范槽加属性行、仅属性行、LOB 或向量引用。
 
 跨分区边必须满足以下损坏校验规则：
 
@@ -945,7 +1288,7 @@ IN Entry.neighbor_vid                 == src_vid
 - 优化器需要按 Edge Type 读取度数；
 - 超级节点需要保存大量分片入口；
 - 在线重建时原子切换根指针；
-- 每种边独立维护 Zone Map、Bloom Filter 和压缩格式。
+- 每种边独立选择 Schema Layout、排序和分片策略。
 
 如果所有边共用一个邻接指针，查询 `MANAGES` 时可能扫描大量 `CLICKED` 边。目录让查询直接进入目标 Edge Type。
 
@@ -981,6 +1324,17 @@ typedef struct st_graph_adj_dir_entry {
 } graph_adj_dir_entry_t;            /* 32B */
 ```
 
+`entry_format` 与邻接项宽度对应，Directory Entry 和 Adjacency Data Page 使用同一编号：
+
+```text
+0 ENTRY_16    只有 16B neighbor_vid + EID
+1 ENTRY_24    16B 基础项加 8B 方向 Inline Payload
+2 ENTRY_32    16B 基础项加 16B 方向 Inline Payload
+3–255 非法
+```
+
+`shard_policy` 的编号是：`0 HASH_NEIGHBOR`、`1 RANGE_NEIGHBOR`、`2 RANGE_TIME`、`3 EDGE_SUBTYPE`、`4 EDGE_TYPE_HASH`。未分片时写 0，同时 `shard_count=1`。`sort_key_id` 是 Schema Layout 中排序键的稳定序号，0 表示该 Edge Type 不要求邻接项有序；升降序由 DDL 的 `SORT BY` 记入 Schema，不占用这个字节。`flags` 在 V1 必须为 0，项的分配和删除状态放在 Side Slot 中。
+
 Directory和Adjacency Data都采用带generation和ITL的8B Side Slot：
 
 ```c
@@ -992,6 +1346,8 @@ typedef struct st_graph_adj_object_slot {
     uint8  flags;                    /* ALLOCATED/DELETED/MOVED */
 } graph_adj_object_slot_t;           /* 8B */
 ```
+
+Side Slot `flags` 的位是：`bit 0 ALLOCATED`、`bit 1 DELETED`、`bit 2 MOVED`，其余位 V1 必须为 0。`graph_adj_slot_t` 使用相同的三位。`MOVED` 只表示页面整理后的偏移已经改变，Locator 仍使用原来的 `object_slot` 和 `generation`。
 
 `object_slot` 是稳定数组下标，页面整理只能修改 `object_offset`，不能改变Slot编号和generation。Directory Entry的MVCC归属于对应Side Slot，不在32B Payload中重复保存ITL。
 
@@ -1008,26 +1364,58 @@ free space
 page_tail_t
 ```
 
-类型扩展头为48B：
+类型扩展头为36B：
 
 ```c
 typedef struct st_graph_adj_dir_page_header {
-    graph_vid_t owner_vid;
-    uint8  direction;
-    uint8  directory_level;
-    uint16 object_count;
-    uint32 live_object_count;
-    uint32 directory_version;
-    graph_adj_locator_t next_page;
-    graph_adj_locator_t prev_page;
-    uint16 free_begin;
-    uint16 free_end;
-    uint8  itl_count;
-    uint8  itl_capacity;
-    uint16 flags;                    /* PACKED/EXTERNAL/SHARD/MIGRATION */
-    uint32 reserved_zero;
-} graph_adj_dir_page_header_t;       /* 48B */
+    uint8  adj_dir_format_version;  /* offset 0,  V1=1 */
+    uint8  header_bytes;            /* offset 1,  V1=36 */
+    uint8  direction;               /* offset 2 */
+    uint8  flags;                   /* offset 3 */
+
+    graph_vid_t owner_vid;          /* offset 4 */
+
+    uint16 object_count;            /* offset 12，Side Slot高水位 */
+    uint16 live_object_count;       /* offset 14 */
+    uint32 directory_version;       /* offset 16，固定32 bit */
+
+    uint16 free_begin;              /* offset 20 */
+    uint16 free_end;                /* offset 22 */
+    uint8  itl_count;               /* offset 24 */
+    uint8  itl_capacity;            /* offset 25 */
+    uint16 reserved_zero;           /* offset 26 */
+
+    graph_adj_locator_t next_page;  /* offset 28 */
+} graph_adj_dir_page_header_t;      /* 36B */
 ```
+
+前2B兼容前缀保持不变。`flags` 使用紧随前缀的第3字节，不占用兼容前缀。字段按“页面身份、对象统计、页内空间、后继页”排列，自然满足4B对齐，没有隐式填充。该格式尚未落盘，因此直接作为V1布局。
+
+V1不保存 `directory_level` 和 `prev_page`。第一期目录不是多层树；一个顶点的一个方向从已发布根沿 `next_page` 到达该方向的全部目录页，空Locator表示链尾。这与邻接数据页只保留 `next_page` 的规则相同。拆分页或合并页时，从已发布根扫描得到前驱，只修改前驱的 `next_page`，并在Undo中记录旧值；不能从链中页反向查找前驱。扫描必须校验 `owner_vid`、`direction`、`directory_version` 和 Page Generation，并拒绝回环。所有仍被旧快照、缓存、Buffer Pin或DRC引用的页面，在引用退出前不得回收。
+
+`object_count` 是包含已删除Slot的高水位。读取枚举全部 `object_count` 个Side Slot，不能用 `live_object_count` 提前停止。`live_object_count` 必须小于或等于 `object_count`，只用于统计和一致性校验；两者不一致时以Slot数组为准并继续完整扫描。oGRAC页面最大32KB，页头、24B身份、36B目录头和页尾至少占用100B，最小目录对象为8B Side Slot加16B Payload。因此一页最多约1361个对象，远小于65535。两个计数都固定16 bit，增加到 `UINT16_MAX` 时返回错误，禁止回绕成0。
+
+`flags` 固定8 bit：
+
+```text
+bit 0  PACKED
+bit 1  EXTERNAL
+bit 2  SHARDED
+bit 3  MIGRATING
+bit 4–7 reserved，V1必须为0
+```
+
+`PACKED`、`EXTERNAL`、`SHARDED` 互斥，`MIGRATING` 可以与其中一位同时置位。页级标志只交叉校验顶点描述符中的方向模式，边和目录项本身仍在对象与Side Slot中。V1读到保留位为1时把页面视为损坏，不能忽略后继续解析。
+
+目录页使用与Adjacency Data Page相同的空间规则：
+
+```text
+header_end <= free_begin <= free_end
+free_end <= 固定ITL区域起点
+itl_count <= itl_capacity
+```
+
+`directory_version` 固定为 32 bit。它是该顶点单个方向的目录结构发布号，目录链页面和 Adjacency Data Page 在挂接时复制它，读取时必须等于当前已发布的目录版本。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
 
 Packed模式在同类Slotted Page中保存小目录及其小邻接列表：
 
@@ -1040,6 +1428,8 @@ typedef struct st_graph_packed_adj_list_header {
     uint32 flags;
 } graph_packed_adj_list_header_t;    /* 16B，随后是Adjacency Entry数组 */
 ```
+
+`entry_count` 是这个小列表中的邻接项数量。`flags` 在 V1 必须为 0，列表的删除和版本由它所在的 Side Slot 与 ITL 表达。
 
 Packed Directory Entry的 `root_locator` 指向该对象。对象可以与目录在同页；空间不足或数量超过阈值时，创建External Directory和Adjacency Data Page，再以MVCC版本化方式切换Vertex Descriptor Root。
 
@@ -1059,7 +1449,9 @@ typedef struct st_graph_adj_shard_entry {
 } graph_adj_shard_entry_t;           /* 32B */
 ```
 
-`lower_bound/upper_bound` 按Shard Policy解释为Hash、VID范围或时间桶边界。迁移对象为：
+`lower_bound/upper_bound` 按Shard Policy解释为Hash、VID范围或时间桶边界。`graph_adj_shard_entry_t.flags` 在 V1 必须为 0。`route_epoch` 是这组分片边界的发布代次；重分布期间新边界使用新代次，查询不能把新旧边界混在一次扫描中。它不代替 `directory_version`：前者标识分片路由，后者标识目录页链是否仍属于已发布目录。
+
+迁移对象为：
 
 ```c
 typedef struct st_graph_adj_migration {
@@ -1073,7 +1465,23 @@ typedef struct st_graph_adj_migration {
 } graph_adj_migration_t;             /* 32B */
 ```
 
-查询SCN早于 `switch_scn` 时走old root，晚于或等于它时走new root。未完成切换时允许双读，但必须按EID去重。
+查询SCN早于 `switch_scn` 时走old root，晚于或等于它时走new root。未完成切换时允许双读，但必须按EID去重。`old_mode/new_mode` 使用顶点描述符中的邻接模式编号。`route_epoch` 标识这一次模式切换，`flags` 在 V1 必须为 0。可见性只由 `switch_scn` 决定。
+
+### 10.4 形态切换
+
+第一期使用下面的默认规则。`PROMOTE_AT_DEGREE`、分片数和每片目标边数可以由第 17.5 节的 DDL 覆盖；Packed 晋升阈值先固定，确认基准后再考虑做成参数。
+
+| 当前形态 | 触发条件 | 新形态 |
+|---|---|---|
+| `NO_ADJACENCY` | 该方向第一条边 | `DIRECT` |
+| `DIRECT` | 同一方向出现第二种 Edge Type | `PACKED_DIRECTORY` |
+| `PACKED_DIRECTORY` | 某个 Packed 对象编码超过 2048B，或其中一类 `entry_count` 超过 32，或下一次写入放不进当前页 | `EXTERNAL_DIRECTORY` |
+| `DIRECT` | 这唯一的 Edge Type 度数达到 `PROMOTE_AT_DEGREE`，默认 100000 | `SUPERNODE_SHARDED` |
+| `EXTERNAL_DIRECTORY` | 其中某一个 Edge Type 达到 `PROMOTE_AT_DEGREE` | Mode 保持 `EXTERNAL_DIRECTORY`，只把该类型的 Directory Entry 指向 Shard 数组 |
+
+`DIRECT` 的 Root 指向这一种 Edge Type 的第一张邻接数据页，`edge_count_hint` 是精确值。第二种 Edge Type 不能继续挂在这个 Root 上，否则查询一种边会扫到另一种边。Packed 对象每次修改都复制整份小列表，所以超过 2048B 或 32 条就拆成每种边一条外部页链。只有一种边且度数达到阈值时，顶点 Mode 改为 `SUPERNODE_SHARDED`。多种边里只有一种达到阈值时，不把其他边一并分片。
+
+默认分片是 `HASH(neighbor_vid)`，`MIN_SHARDS=16`，每片目标 65536 条，`MAX_SHARDS=256`。第一期不因为删除而自动退回更低形态，避免度数在阈值附近来回切换。切换一律先写 Migration 对象和 `switch_scn`，再原子发布新的 Mode 与 Root。
 
 ## 11. 邻接项与三类 Inline Properties
 
@@ -1166,7 +1574,6 @@ IN INLINE 中存在：更新目标顶点入邻接项
 page_head_t
 graph_page_identity_t
 graph_adj_data_page_header_t
-Zone Map / Bloom元数据
 Adjacency Entry payloads →
 free space
 ← graph_adj_slot_t array
@@ -1174,55 +1581,65 @@ free space
 page_tail_t
 ```
 
-类型扩展头为64B：
+Phase 1类型扩展头为56B，不持久化Zone Map、Bloom Filter或页面级失效投影掩码：
 
 ```c
 typedef struct st_graph_adj_data_page_header {
+    uint8  adj_data_format_version; /* V1=1 */
+    uint8  header_bytes;            /* V1=56 */
+    uint16 schema_layout_id;
     graph_vid_t owner_vid;
     uint32 edge_type_id;
-    uint16 schema_layout_id;
     uint8  direction;
     uint8  entry_format;
     uint16 shard_id;
     uint16 shard_count;
     uint16 entry_size;
     uint16 slot_count;
+    uint16 reserved_zero1;
     uint32 live_count;
     uint32 flags;
     graph_adj_locator_t next_page;
-    uint32 directory_version;
-    uint16 zone_map_offset;
-    uint16 zone_map_bytes;
-    uint16 bloom_offset;
-    uint16 bloom_bytes;
-    uint16 invalid_projection_mask;
+    uint32 directory_version;       /* 固定32 bit，等于已发布目录版本 */
     uint16 free_begin;
     uint16 free_end;
     uint8  itl_count;
     uint8  itl_capacity;
-    uint32 reserved_zero;
-} graph_adj_data_page_header_t;      /* 64B */
+    uint16 reserved_zero2;
+} graph_adj_data_page_header_t;      /* 56B */
 ```
+
+`free_begin` 是下一个Entry Payload的写入位置，`free_end` 是反向增长的Side Slot数组起点；可用空间为 `free_end - free_begin`。页面整理可以移动Payload并更新Side Slot中的 `entry_offset`，但不能改变稳定Slot编号和generation。读取时必须满足：
+
+```text
+header_end <= free_begin <= free_end
+free_end <= 固定ITL区域起点
+itl_count <= itl_capacity
+```
+
+`slot_count` 是 Side Slot 高水位，读取时逐个扫描，不能用 `live_count` 提前停止。`live_count` 是可落后的可见项估计。`shard_id` 从 0 开始，未分片页面的 `shard_id=0` 且 `shard_count=1`。`flags` 在 V1 必须为 0；页面身份由 `owner_vid`、`direction`、`edge_type_id` 和 `shard_id` 校验。
 
 `next_page` 形成同一个 `(owner_vid, direction, edge_type_id, shard_id)` 的页面链。每次进入页面必须校验这些字段、Schema Layout、Directory Version和Page Generation。
 
-查询可以先用页头范围跳过整页，再用邻接项属性过滤，最后只读取命中的规范边和顶点。如果谓词对应的投影在本页存在失效项，则 Zone Map 只能处理有效项，失效项必须进入原值回读队列，不能被当作“不匹配”跳过。
+Phase 1查询扫描页内可见Adjacency Entry及其Inline状态，不能依赖页面级范围或集合摘要跳页。Zone Map、Bloom Filter和 `invalid_projection_mask` 只有在基准测试证明收益后，才作为 `adj_data_format_version=2` 的追加字段引入；V2必须增加 `header_bytes` 并注册精确长度。已有V1页面通过后台整页重写升级，不能在原Header中原地扩展。启用V2前仍受集群兼容矩阵和全节点写入门禁约束。
 
-Directory计数、Data Page的 `live_count`、Zone Map和Bloom Filter都是保守摘要，不决定MVCC可见性。摘要落后只能导致额外扫描，不能排除可能可见的数据；恢复时可以根据可见Entry重新计算。每个Vertex、Canonical Edge、Directory Object和External Adjacency Entry分别通过所在页面的Side Slot或Meta引用PCR ITL；Packed List整体使用一个Object Slot。创建一条边时这些记录可以使用不同页内ITL编号，但必须属于同一个数据库事务。
+Directory计数和Data Page的 `live_count` 是保守摘要，不决定MVCC可见性。计数落后只能导致额外扫描，不能排除可能可见的数据；恢复时可以根据可见Entry重新计算。每个Vertex、Canonical Edge、Directory Object和External Adjacency Entry分别通过所在页面的Side Slot或Meta引用PCR ITL；Packed List整体使用一个Object Slot。创建一条边时这些记录可以使用不同页内ITL编号，但必须属于同一个数据库事务。
 
 ### 11.4 时间 Inline 类型
 
-第一期不提供 `UINT32_DELTA`。只提供 `TIME32` 和 `TIME64`：
+第一期不提供 `UINT32_DELTA`。只提供 `INLINE_TIME32` 和 `INLINE_TIME64`。所有 Inline CAST 目标类型都使用 `INLINE_` 前缀，避免与顶点、边属性声明中的 `TIMESTAMP`、`INTEGER` 等普通 SQL 类型重名。`HASH32_VERIFY` 是预过滤函数，可见结果类型仍是 `INTEGER`，不是另一种列类型。
+
+时间投影写成：
 
 ```sql
-CAST(timestamp AS TIME32 WITH (
+CAST(timestamp AS INLINE_TIME32 WITH (
     BASE = TIMESTAMP '2020-01-01 00:00:00+00:00',
     UNIT = SECOND,
     OVERFLOW = REJECT
 ))
 ```
 
-`TIME32` 保存相对显式 Base 的有符号 32-bit 时间差，`TIME64` 保存有符号 64-bit 时间差。`BASE` 和 `UNIT` 必填：
+`INLINE_TIME32` 保存相对显式 Base 的有符号 32-bit 时间差，`INLINE_TIME64` 保存有符号 64-bit 时间差。`BASE` 和 `UNIT` 必填：
 
 - `BASE` 必须是带明确时区或已经规范化时区的时间字面量；
 - 禁止 `GRAPH_EPOCH`、`now()`、`current_time`、序列值、会话变量等动态来源；
@@ -1273,7 +1690,7 @@ encoded = CAST(expression - base AS inline_numeric_type)
 
 ### 11.6 Overflow 语义与失效值
 
-所有 `TIME32`、`TIME64` 和 `INLINE_*` 数值类型支持：
+所有 `INLINE_TIME*`、`INLINE_INT*`、`INLINE_UINT*` 和 `INLINE_FP*` 目标类型支持：
 
 ```text
 OVERFLOW = REJECT | WARNING
@@ -1292,7 +1709,7 @@ OVERFLOW = REJECT | WARNING
 
 状态 `00` 表示逻辑 NULL，不需要回读；状态 `01` 才允许直接解码 Inline 字节。状态 `10` 不能被当作 NULL 或“不匹配”。
 
-OUT/IN `inline_property_state_bitmap` 属于8B或16B方向负载预算，不额外扩大Entry。Page Header的 `invalid_projection_mask` 只记录每个属性是否存在至少一个状态 `10`，不保存精确计数；只要对应bit为1，使用该属性的Zone Map就不能排除这些项。
+OUT/IN `inline_property_state_bitmap` 属于8B或16B方向负载预算，不额外扩大Entry。Phase 1没有页面级 `invalid_projection_mask`，执行器必须逐Entry识别状态 `10` 并回读规范值。未来V2页面摘要也只能跳过状态 `01` 的值，不能因摘要不匹配而跳过状态 `10` 的Entry。
 
 `WARNING` 保证SQL成功和结果正确，但可能降低查询性能。精确失效计数由后台统计扫描写入Catalog统计，不属于Adjacency Page持久化头；系统视图基于该统计暴露每个Inline投影的失效率，超过阈值时建议修改Base、目标类型或移除该投影。
 
@@ -1310,7 +1727,7 @@ HASH32_VERIFY(expression1, expression2, ...)
 - 每个参数包含类型标签、NULL 标记和长度，禁止字符串简单拼接；
 - 字符串遵循声明的字符集和 Collation 规范化；
 - 时间统一到 Schema 声明的时区和精度；
-- Hash 算法版本记录在 Schema Layout 中，跨节点和升级保持一致。
+- Hash 算法版本记录在 Schema Layout 中，跨节点和升级保持一致。`hash_algo_version=1` 表示对规范字节串调用内核 `cm_hash_raw`。函数实现变化时必须增加版本号，旧 Layout 仍使用原来的版本。
 
 `HASH32_VERIFY` 永远不是规范值。Hash 命中后必须读取原始表达式涉及的属性并执行原谓词验证。它不能单独用于唯一约束、外键、排序或范围过滤。
 
@@ -1321,6 +1738,24 @@ HASH32_VERIFY(tenant_id, campaign_id) AS tenant_campaign_hash
 ```
 
 查询优化器只有在能保留并执行原始 `(tenant_id, campaign_id)` 等值条件时才能使用该 Hash。用户可见 SQL 类型是 `INTEGER`，物理上按 32 bit 原始位模式保存。
+
+### 11.8 Inline 字节排列与 Schema Layout
+
+多个 Inline 值按投影 ordinal 从小到大紧凑存放，小端，字段之间不补齐。顶点和规范边的两位状态在 Meta 中，不占 `inline_values`。OUT/IN 负载的前 2B 是状态位图，紧随其后的编码值同样紧凑排列。预算末尾未使用的字节写零。
+
+不按 2、4 或 8 字节对齐。8B、16B 和 24B 预算里，对齐填充会占掉很大比例；当前平台上一次非对齐的 4B 或 8B 读取相对一次页面访问可以忽略。广告图顶点示例的 16B 预算按下面的偏移解码：
+
+```text
+offset 0   status            INLINE_INT8    1B
+offset 1   region_id         INLINE_UINT16  2B
+offset 3   user_level        INLINE_INT32   4B
+offset 7   last_active_time  INLINE_TIME64  8B
+offset 15  未使用，写 0
+```
+
+点击边的 16B EDGE INLINE 则是 timestamp 8B、weight 4B、status 2B、device_type 2B，从 offset 0 连续排放。
+
+`schema_layout_id` 指向一份不可变的布局记录，列在 `SYS_GRAPH_SCHEMA_LAYOUT` 和 `SYS_GRAPH_INLINE_PROJ`。顶点类型和边类型各自递增自己的编号。一份边布局同时描述 EDGE、OUT、IN 三类投影；一份顶点布局只描述顶点投影。记录创建后不修改表达式、目标类型、Base、单位、溢出策略、编码宽度和 Hash 版本。变更布局时分配新的 `schema_layout_id`。
 
 ## 12. Inline Edge 的取舍
 
@@ -1353,42 +1788,21 @@ Inline Edge Capacity = 0
 
 ## 13. 属性页
 
-`23 Property Data Page` 复用 PCR Heap：
+`23 Property Data Page` 复用 PCR Heap，不在行头和列值之间插入私有的 24B 图身份头。堆行已经有自己的 `row_head_t`、NULL 位图、变长列和 LOB Locator。再插入一层私有头会让普通堆扫描把这 24B 当成用户列，也重复保存堆行自己已经知道的行长。
 
-- `24` 保存 External ID、冷顶点属性、JSON、角色附加属性和向量 ID；
-- `25` 保存冷边属性、JSON、审计信息、时态扩展值和向量 ID；
-- 大对象继续使用 LOB locator；
-- 向量本体存放在独立 Vector Segment，图记录只保存引用、量化摘要或聚类编号。
+每个顶点类型、每个边类型各有一张普通 PCR 堆表，表号记在对应的类型 Catalog 中。冷属性、JSON、Tag 附加属性、审计信息和向量 ID 都是这张表的普通列。大对象继续用 LOB，向量本体仍在后续独立的 Vector Segment 中，图行只保存引用。
 
-`24 Vertex Property Row` 和 `25 Edge Property Row` 在现有PCR Heap Row Header及列数据之间增加24B Graph身份头：
+身份校验做成系统列，而不是页格式：
 
-```c
-typedef struct st_graph_property_row_header {
-    uint32 graph_id;
-    uint16 schema_layout_id;
-    uint8  owner_kind;               /* VERTEX/EDGE */
-    uint8  flags;
-    uint64 owner_id;                 /* graph-relative VID或EID */
-    uint16 owner_generation;
-    uint16 payload_format;
-    uint32 payload_bytes;
-} graph_property_row_header_t;       /* 24B */
-```
+| 系统列 | 类型 | 作用 |
+|---|---|---|
+| `owner_id` | `UINT64` | 顶点行存 VID，边行存 EID |
+| `owner_generation` | `UINT16` | 必须等于 `owner_id` 中的 generation |
+| `schema_layout_id` | `UINT16` | 写入时的布局版本，供双读 |
 
-其后的列值、NULL Bitmap、变长列和LOB Locator继续使用PCR Heap现有Row格式与Catalog列映射，不重新定义一套属性编码。
+`08` 和 `22` 仍保存现有 8B `rowid_t`。没有属性行时写 `INVALID_ROWID`。读取使用现有 PCR Heap 接口，并沿用堆行迁移链。取回行之后比较 `owner_id`、`owner_generation` 和 `schema_layout_id`。任一不匹配都视为陈旧 RowID 或损坏，不能把该行返回给其他顶点或边。业务表的物理位置继续单独缓存，并用业务主键校验。
 
-`08` 和 `22` 使用现有8B `rowid_t`，无属性行时写统一的 `INVALID_ROWID`。RowID只保证物理定位，读取后必须校验：
-
-```text
-graph_id
-owner_kind
-owner_id
-owner_generation
-schema_layout_id是否可读
-PCR MVCC可见性
-```
-
-任一身份不匹配都视为陈旧RowID或页面损坏，不能把该行返回给其他Vertex/Edge。业务表物理位置单独缓存，并通过业务主键校验。
+这样 `ADD PROPERTY` 可以直接使用现有加列能力。图代码不需要教堆扫描器跳过私有前缀。
 
 ## 14. 超级节点
 
@@ -1418,30 +1832,60 @@ PCR MVCC可见性
 
 ## 15. 多 Label
 
-`label_set_id` 指向复用的 Label 集合：
+`vertex_meta.label_set_id` 的 32 bit 同时承担两种编码，最高位区分模式：
 
 ```text
-42 → {User, Person, Employee, Manager}
-43 → {User, Person, Employee}
+bit 31 = 0    常用 Label 内联位图
+  bits 0–30   common_ordinal 0–30，一位对应一个常用 Label
+  0           当前没有任何 Label
+
+bit 31 = 1    外部 Label Set
+  bits 0–30   非 0 的 label_set_id
+  0x80000000  非法
+```
+
+一个图最多注册 31 个常用 Label。创建顶点类型或 `CREATE VERTEX TAG ... COMMON` 时分配 `common_ordinal`，序号写入 `SYS_GRAPH_LABEL` 后不可改变、不可复用。未标记 `COMMON` 的 Label 没有序号。31 个序号用完或退休后，新 Label 只能进入外部 Label Set。第一期不允许把已有 Label 在常用与非常用之间在线转换，因为这会改变所有顶点槽中这 32 bit 的含义。
+
+顶点当前的 Label 全部属于常用集合时，直接把对应位写入槽内，不创建 Label Set 行，判断时也不查 Dictionary Cache。例如 `User=0`、`Person=1`、`Employee=2`、`Manager=3`：
+
+```text
+{User, Person, Employee, Manager} = 0x0000000F
+{User, Person, Employee}          = 0x00000007
+```
+
+只要集合中有一个非常用 Label，低 31 位就不再是位图，而是外部集合编号。外部集合保存完整成员，包含其中的常用 Label。顶点同时拥有常用 `User` 和非常用 `Contractor` 时写成 `0x80000000 | set_id`，该 `set_id` 的成员是 `{User, Contractor}`。不能只把非常用 Label 放进外部集合，否则常用 Label 的判断会丢失。
+
+从已知 VID 判断一个或多个 Label 时只读取这一个 32 bit 字：
+
+```text
+word = label_set_id
+bit31 = 0:
+    Label 没有 common_ordinal → 不包含
+    否则测试 bits[common_ordinal]
+    多个常用 Label 一次做位图包含判断
+bit31 = 1:
+    用 bits 0–30 查询 Dictionary Cache
+    Cache 保存该集合的完整成员位图
+    常用 Label 和非常用 Label 都在这张位图中判断
 ```
 
 Catalog：
 
 ```text
-SYS_GRAPH_LABEL
-SYS_GRAPH_LABEL_SET
+SYS_GRAPH_LABEL                 /* 含不可变 common_ordinal，NULL 表示非常用 */
+SYS_GRAPH_LABEL_SET             /* 只保存无法放入内联位图的完整集合 */
 SYS_GRAPH_LABEL_SET_MEMBER
 ```
 
-Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 Label 时执行一次位图包含判断。
+外部 `label_set_id` 按完整成员复用，集合内容不可变。编号 0 保留。已发布给顶点槽、Undo、快照或缓存的编号不得改指另一组成员；31 bit 编号耗尽时拒绝新的不同集合，禁止回绕。
 
-从 Label 扫描全图时使用按分区组织的倒排索引：
+从 Label 扫描全图时仍使用按分区组织的倒排索引。内联位图只加速已知 VID 的判断，不代替倒排：
 
 ```text
 (graph_id, label_id, virtual_partition_id) → compressed VID list
 ```
 
-添加或删除 Tag 时创建或复用新的 Label Set，事务内更新顶点槽和倒排索引。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
+添加或删除 Tag 时在同一事务中计算新的完整集合，并更新顶点槽与倒排索引。新集合能放入常用位图时写回 bit31 为 0 的字；否则创建或复用外部 Label Set，再写回 `0x80000000 | set_id`。旧快照通过 CR 读取旧字。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
 
 ## 16. 复杂查询的遍历流程
 
@@ -1457,7 +1901,7 @@ Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 L
  → 02/04/05 User Vertex Slot
 ```
 
-读取 `06.label_set_id`，确认包含 `User`。
+读取 `06.label_set_id`。`User` 为常用 Label 且 bit31 为 0 时，直接测试它的 `common_ordinal`；bit31 为 1 时，用低 31 位读取外部集合的完整成员并确认包含 `User`。
 
 ### 16.2 第一跳 CLICKED
 
@@ -1468,7 +1912,7 @@ Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 L
  → 将Descriptor复制到执行器并释放Vertex Page latch
  → 按Mode解析Root
  → 定位CLICKED OUT
- → 页头Zone Map/Bloom跳过不符合时间范围的页
+ → 逐Entry扫描OUT Inline时间投影，状态10的项回读规范值
  → 16中按PCR可见性读取neighbor_vid、EID及OUT Inline属性
  → 得到seed VID和click EID
 ```
@@ -1509,7 +1953,8 @@ owner_vid == 当前顶点VID
 direction == OUT
 edge_type_id == CLICKED
 schema_layout_id可读
-directory_version和root generation匹配
+directory_version等于当前已发布目录版本
+root locator generation匹配
 ```
 
 扫描Entry时：
@@ -1572,6 +2017,14 @@ candidate VID → 26/05 → 07 热属性 → 必要时 08/24
 
 任一页面修改失败，事务整体回滚。
 
+加锁只覆盖这次真正修改的页，并且遵守固定顺序：
+
+1. Segment Head 和 Extent Map 只在分配或格式化逻辑页时持有。持有它们时不得等待数据页 Latch。中途发现需要新页，就释放已经持有的数据页 Latch，完成分配和格式化，再重新按顺序获取。
+2. 顶点页、规范边页、邻接页、目录页和空闲目录页按物理 `page_id`（file，page）升序获取 X Latch。远程页的 DRC X Owner 也按这个顺序申请，后一页必须等前一页授予之后再申请。A→B 与 B→A 因此不会交叉等待。同一页内按 `slot_id` 或 `object_slot` 升序修改。
+3. 属性堆表和 PCR B-tree 使用它们原有的加锁顺序。先插入属性行并释放堆页和索引页，得到 `rowid_t`，再执行第 2 步把 RowID 写入图槽。图页 Latch 不和堆页、索引页交叉持有。
+4. `DIRECT` 和 `PACKED` 的 `edge_count_hint` 是精确值，源顶点页和目标顶点页都加入第 2 步。`EXTERNAL` 和 `SUPERNODE_SHARDED` 的 hint 不是精确值，热路径不修改对端顶点槽，避免所有入边串行在超级节点的顶点页上；64-bit 精确计数写在 Directory Entry 或 Shard Entry 中。
+5. 分裂导致页集合变化时，释放全部数据页 Latch，把新页加入集合后重试。重试继续使用已经分配的 EID，不能再分配一条边。
+
 第一次创建邻接或发生 `DIRECT→PACKED→EXTERNAL→SHARDED` 转换时，先完整构造新Root，再在Vertex Slot的PCR ITL保护下原子更新对应方向的Mode Nibble和Descriptor Root。旧查询通过CR Vertex Slot读取旧Root；只有旧快照结束后才回收旧对象。Mode和Root不能分两次无版本写入。
 
 ### 16.6 删除边和顶点
@@ -1582,10 +2035,10 @@ candidate VID → 26/05 → 07 热属性 → 必要时 08/24
 Canonical Edge Slot
 源顶点OUT Adjacency Entry
 目标顶点IN Adjacency Entry
-必要的Directory计数和摘要失效标记
+必要的Directory计数
 ```
 
-摘要允许延迟重算，但三个可见记录必须原子删除。只有早于删除SCN的查询全部结束后，Adjacency Object Slot和Canonical Edge Slot才允许递增generation并复用。
+Directory计数可以延迟修正为保守值，但三个可见记录必须原子删除。只有早于删除SCN的查询全部结束后，Adjacency Object Slot和Canonical Edge Slot才允许递增generation并复用。
 
 第一期普通 `DELETE vertex` 采用 `RESTRICT`：只要任一方向存在可见边就拒绝。`DETACH DELETE` 同步删除所有入边、出边和Canonical Edge后再删除Vertex；不提供可能留下悬空 `neighbor_vid` 的异步清理。Vertex Slot只有在全部邻接清理且旧快照结束后才能复用。
 
@@ -1599,13 +2052,14 @@ Canonical Edge Slot
 CREATE GRAPH ad_graph
 OPTIONS (
     DEFAULT_CONSISTENCY = 'STATEMENT',
-    PAGE_SIZE = '8K',
     VIRTUAL_PARTITIONS = 65536,
     PLACEMENT_PARTITIONS = 1024,
     VERTEX_INLINE_SIZE = 16,
     EID_LAYOUT = 'VP16_PAGE24_SLOT8_GEN16'
 );
 ```
+
+图页面使用数据库已有的 `PAGE_SIZE`，只能是 8KB、16KB 或 32KB。图不能单独指定页大小，因为 Buffer、表空间和 Redo 都以数据库页大小为单位。
 
 `VIRTUAL_PARTITIONS` 是 VID 编码空间。物理 Segment 按实际出现的数据延迟创建。`PLACEMENT_PARTITIONS` 是当前迁移和调度粒度。
 
@@ -1645,7 +2099,7 @@ STORAGE (
         CAST(user_level AS INLINE_INT32 WITH (
             OVERFLOW = REJECT
         )) AS user_level,
-        CAST(last_active_time AS TIME64 WITH (
+        CAST(last_active_time AS INLINE_TIME64 WITH (
             BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
             UNIT = MICROSECOND,
             OVERFLOW = REJECT
@@ -1655,26 +2109,29 @@ STORAGE (
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。
+DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。顶点类型名同时注册为 Label。广告图示例将 `User` 标为 `COMMON` 并取得序号 0，后续 Tag 再依次取得序号。
 
 第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边由Packed Small Adjacency Page承载。
 
 ### 17.3 Tag
 
 ```sql
-CREATE VERTEX TAG Person FOR TYPE User IN GRAPH ad_graph;
+CREATE VERTEX TAG Person FOR TYPE User IN GRAPH ad_graph
+COMMON;
 
-CREATE VERTEX TAG Employee FOR TYPE User IN GRAPH ad_graph (
+CREATE VERTEX TAG Employee FOR TYPE User IN GRAPH ad_graph
+COMMON (
     employee_no VARCHAR(32),
     department_id BIGINT
 );
 
-CREATE VERTEX TAG Manager FOR TYPE User IN GRAPH ad_graph (
+CREATE VERTEX TAG Manager FOR TYPE User IN GRAPH ad_graph
+COMMON (
     management_level SMALLINT
 );
 ```
 
-Tag 属性默认进入属性行。
+`COMMON` 为该 Tag 分配不可变的常用 Label 序号，使只包含这些 Label 的顶点把成员放进 `label_set_id` 的低 31 位。Tag 属性默认进入属性行。
 
 ```cypher
 MATCH (u:User {external_id: $id})
@@ -1698,7 +2155,7 @@ FROM User TO Advertisement (
 STORAGE (
     EDGE_SLOT_PROFILE = AUTO,
     EDGE INLINE PROPERTIES (
-        CAST(timestamp AS TIME64 WITH (
+        CAST(timestamp AS INLINE_TIME64 WITH (
             BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
             UNIT = MICROSECOND,
             OVERFLOW = REJECT
@@ -1714,7 +2171,7 @@ STORAGE (
         )) AS device_type
     ),
     OUT INLINE PROPERTIES (
-        CAST(timestamp AS TIME32 WITH (
+        CAST(timestamp AS INLINE_TIME32 WITH (
             BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
             UNIT = SECOND,
             OVERFLOW = WARNING
@@ -1730,7 +2187,7 @@ STORAGE (
         )) AS device_type
     ),
     IN INLINE PROPERTIES (
-        CAST(timestamp AS TIME32 WITH (
+        CAST(timestamp AS INLINE_TIME32 WITH (
             BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
             UNIT = SECOND,
             OVERFLOW = WARNING
@@ -1740,19 +2197,17 @@ STORAGE (
         )) AS status
     ),
     OUT ADJACENCY (
-        SORT BY timestamp DESC,
-        ZONEMAP (timestamp, weight)
+        SORT BY timestamp DESC
     ),
     IN ADJACENCY (
-        SORT BY timestamp DESC,
-        ZONEMAP (timestamp)
+        SORT BY timestamp DESC
     )
 );
 ```
 
-`detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
+第一期 DDL 不接受 `ZONEMAP`。邻接页不保存 Zone Map，排序只决定 `sort_key_id` 和写入顺序。`detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
 
-例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的TIME32秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
+例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的 `INLINE_TIME32` 秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
 ### 17.5 超级节点策略
 
@@ -1790,6 +2245,151 @@ SET SUPER NODE POLICY (
 
 写入接口包括按 External ID 创建顶点、按 Edge Type 创建边、更新属性和删除对象。所有结构修改都在数据库事务中执行。
 
+### 17.7 Catalog
+
+Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，不是下面这些堆表。除 `SYS_GRAPH` 把 `graph_id` 列在表内之外，其余每张表的第一列都是 `graph_id UINT32`，并作为主键前缀；下面只列出其余列。
+
+`SYS_GRAPH`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `graph_id` | `UINT32` | 主键 |
+| `name` | `VARCHAR(128)` | 库内唯一 |
+| `default_consistency` | `UINT8` | 1 `STATEMENT`，2 `TRANSACTION`，3 `EVENTUAL` |
+| `virtual_partition_count` | `UINT16` | 2 的幂，最大 65536 |
+| `placement_partition_count` | `UINT16` | 2 的幂，且能整除上一列 |
+| `vertex_inline_size` | `UINT16` | 0、8 或 16 |
+| `vertex_slot_size` | `UINT16` | 48、56 或 64 |
+| `eid_layout` | `UINT8` | 1 表示 `VP16_PAGE24_SLOT8_GEN16` |
+| `map_features` | `UINT32` | bit 0 为 `GRAPH_MAP_FEATURE_PAGE_EXCEPTION`，V1 必须为 0 |
+| `max_staleness_scn` | `UINT64` | `EVENTUAL` 允许落后的 SCN 距离 |
+| `schema_epoch` | `UINT64` | 布局发布号 |
+| `tablespace_id` | `UINT32` | 图 Segment 和属性表所在表空间 |
+| `status` | `UINT8` | 1 `ONLINE`，2 `MIGRATING`，3 `DROPPED` |
+| `created_scn` | `UINT64` | 创建 SCN |
+
+`SYS_GRAPH_PLACEMENT` 的主键是 `(graph_id, vp_start)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `vp_start`、`vp_end` | `UINT16` | 闭区间，区间之间不重叠且覆盖 `0 .. count-1` |
+| `placement_id` | `UINT16` | 调度单位 |
+| `preferred_instance` | `UINT16` | 当前首选节点 |
+| `route_epoch` | `UINT32` | 路由代次 |
+| `state` | `UINT8` | 1 `ONLINE`，2 `MIGRATING` |
+
+`SYS_GRAPH_SEGMENT` 的主键是 `(graph_id, virtual_partition_id, segment_kind)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `virtual_partition_id` | `UINT16` | 数据桶 |
+| `segment_kind` | `UINT8` | 第 7.2 节的 1–4 |
+| `segment_id` | `UINT32` | Segment 编号 |
+| `tablespace_id` | `UINT32` | 表空间 |
+| `entry_file` | `UINT16` | Entry Page 的 file |
+| `entry_page` | `UINT32` | Entry Page 的 page，类型为 `PAGE_TYPE_GRAPH_SEG_HEAD` |
+
+`SYS_GRAPH_ID_NAMESPACE` 的主键是 `(graph_id, namespace_id)`，`(graph_id, name)` 唯一：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `namespace_id` | `UINT16` | 命名空间 |
+| `name` | `VARCHAR(128)` | 例如 `User` |
+| `vertex_type_id` | `UINT32` | 所属顶点类型 |
+
+`SYS_GRAPH_VERTEX_TYPE` 的主键是 `(graph_id, vertex_type_id)`，名称在图内唯一：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `name` | `VARCHAR(128)` | 类型名，同时是一个 Label |
+| `namespace_id` | `UINT16` | External ID 命名空间 |
+| `label_id` | `UINT32` | 类型名对应的 Label |
+| `current_schema_layout_id` | `UINT16` | 新顶点使用的布局 |
+| `property_table_id` | `UINT32` | 冷属性 PCR 堆表 |
+| `status` | `UINT8` | 1 `ACTIVE`，2 `HIDDEN`，3 `DROPPED` |
+
+`SYS_GRAPH_PARTITION_KEY` 的主键是 `(graph_id, vertex_type_id, key_ordinal)`，列是 `property_id UINT32`。分区表达式由这些属性按 ordinal 组成。
+
+`SYS_GRAPH_EDGE_TYPE` 的主键是 `(graph_id, edge_type_id)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `name` | `VARCHAR(128)` | 边类型名 |
+| `src_vertex_type_id`、`dst_vertex_type_id` | `UINT32` | 端点类型 |
+| `slot_profile` | `UINT8` | 0 `AUTO`，1 `COMPACT`，2 `INLINE_8`，3 `INLINE_16`，4 `INLINE_24` |
+| `current_schema_layout_id` | `UINT16` | 新边使用的布局 |
+| `property_table_id` | `UINT32` | 冷边属性堆表 |
+| `sort_ordinal` | `UINT8` | 0 表示不排序；否则是 Inline 投影序号 |
+| `sort_desc` | `UINT8` | 0 升序，1 降序 |
+| `promote_at_degree` | `UINT32` | 默认 100000 |
+| `shard_policy` | `UINT8` | 第 10.3 节的 0–4 |
+| `min_shards`、`max_shards` | `UINT16` | 默认 16 和 256 |
+| `target_edges_per_shard` | `UINT32` | 默认 65536 |
+| `status` | `UINT8` | 与顶点类型相同 |
+
+`SYS_GRAPH_LABEL` 的主键是 `(graph_id, label_id)`，`(graph_id, name)` 唯一：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `name` | `VARCHAR(128)` | Label 名 |
+| `vertex_type_id` | `UINT32` | 所属顶点类型 |
+| `label_role` | `UINT8` | 1 `TYPE`，2 `TAG` |
+| `common_ordinal` | `UINT8` | 0–30；255 表示非常用 |
+| `status` | `UINT8` | 1 `ACTIVE`，2 `RETIRED` |
+
+`SYS_GRAPH_PROPERTY` 的主键是 `(graph_id, property_id)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `owner_kind` | `UINT8` | 1 顶点类型，2 边类型 |
+| `owner_type_id` | `UINT32` | 顶点类型或边类型 |
+| `name` | `VARCHAR(128)` | 属性名 |
+| `sql_type` | `UINT16` | 普通 SQL 类型编号 |
+| `nullable` | `UINT8` | 0 或 1 |
+| `ordinal` | `UINT16` | 类型内的声明顺序 |
+| `max_bytes` | `UINT32` | 变长属性的声明上限，定长类型写 0 |
+
+`SYS_GRAPH_SCHEMA_LAYOUT` 的主键是 `(graph_id, schema_layout_id)`。编号 0 非法，创建后整行不可变：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `owner_kind`、`owner_type_id` | `UINT8`、`UINT32` | 顶点类型或边类型 |
+| `inline_value_bytes` | `UINT16` | 紧凑编码后的字节数 |
+| `slot_size` | `UINT16` | 边布局为 40/48/56/64；顶点布局写图级槽宽 |
+| `hash_algo_version` | `UINT16` | 1 表示 `cm_hash_raw` |
+| `sort_ordinal`、`sort_desc` | `UINT8` | 从边类型复制的排序键 |
+| `status` | `UINT8` | 1 `ACTIVE`，2 `HISTORICAL` |
+
+`SYS_GRAPH_INLINE_PROJ` 的主键是 `(graph_id, schema_layout_id, direction, ordinal)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `direction` | `UINT8` | 1 `VERTEX`，2 `EDGE`，3 `OUT`，4 `IN` |
+| `ordinal` | `UINT8` | 0–7，也是紧凑编码顺序 |
+| `property_id` | `UINT32` | 直接属性；表达式投影写 0 |
+| `expression_text` | `VARCHAR(1024)` | 规范化表达式，直接属性可为空 |
+| `target_type` | `UINT16` | `INLINE_*` 类型编号 |
+| `encoded_width` | `UINT8` | 紧凑编码占用的字节 |
+| `base_kind` | `UINT8` | 0 无，1 整数，2 时间字面量 |
+| `base_int` | `INT64` | 整数 Base；其他种类写 0 |
+| `base_time_text` | `VARCHAR(64)` | 规范化时间字面量 |
+| `unit` | `UINT8` | 0 无，1 `SECOND`，2 `MILLISECOND`，3 `MICROSECOND` |
+| `overflow` | `UINT8` | 1 `REJECT`，2 `WARNING` |
+
+`SYS_GRAPH_LABEL_SET` 的主键是 `(graph_id, label_set_id)`。`label_set_id` 是 31 bit 非 0 编号。列还包括 `member_count UINT16` 和 `member_fingerprint UINT64`。指纹是按 `label_id` 升序拼接后的 `cm_hash_raw`，用来查找已有集合。
+
+`SYS_GRAPH_LABEL_SET_MEMBER` 的主键是 `(graph_id, label_set_id, label_id)`，没有其他列。
+
+`SYS_GRAPH_INDEX` 登记两条 PCR B-tree。主键是 `(graph_id, index_kind)`：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `index_kind` | `UINT8` | 1 ID Map，2 Label 倒排 |
+| `tablespace_id` | `UINT32` | 索引表空间 |
+| `entry_file`、`entry_page` | `UINT16`、`UINT32` | B-tree Entry |
+
+ID Map 的键是 `(graph_id, namespace_id, external_id)`，值是 VID。Label 倒排的键是 `(graph_id, label_id, virtual_partition_id, vid)`，没有额外值。
+
 ## 18. Schema 变更
 
 ### 18.1 增加冷属性
@@ -1824,7 +2424,7 @@ Edge Inline表达式变更会创建新的 `schema_layout_id`。`EDGE_SLOT_PROFIL
 
 ### 18.3 删除和类型变更
 
-删除先逻辑隐藏，等待旧查询结束后物理清理。
+删除先把 `status` 改成 `HIDDEN`，等待旧查询结束后再物理清理。仍有可见顶点引用该类型、仍有可见边使用该边类型，或仍有顶点的 Label 位图、外部 Label Set 包含该 Label 时，删除类型或 Tag 失败。`DROP GRAPH` 在任一 Segment、属性表或索引仍存在时失败。第一期不在线清空非空图。
 
 安全扩展可以延迟转换，例如更窄整数扩展到更宽整数。不兼容转换要求显式转换表达式、后台校验和错误处理策略。
 
@@ -1839,16 +2439,16 @@ TO INSTANCES (0, 1, 2, 3);
 ```
 
 ```text
-选择一组 Virtual Partition
+选择若干 SYS_GRAPH_PLACEMENT 区间
  → 标记 MIGRATING
  → 预热目标节点
- → 更新 route_epoch
+ → 更新 preferred_instance 和 route_epoch
  → 新请求进入目标节点
  → 等待旧请求结束
  → 标记 ONLINE
 ```
 
-VID 不变。Preferred Instance 是性能提示，节点故障后由 DRC 保证可访问性，并更新路由。
+搬迁单位是第 5.4 节的连续 Virtual Partition 区间，不是单个顶点。VID 不变。Preferred Instance 是性能提示，节点故障后由 DRC 保证可访问性，并更新路由。
 
 ### 19.2 调整 Placement 数量
 
@@ -1858,7 +2458,7 @@ SET PLACEMENT PARTITIONS 2048
 ONLINE;
 ```
 
-该操作重组 Virtual Partition 到 Placement Partition 的映射，不修改 VID 和边引用。
+新的 Placement 数量必须是 2 的幂，并且能整除 Virtual Partition 数量。该操作重写 `SYS_GRAPH_PLACEMENT` 的连续区间，不修改 VID 和边引用。
 
 ### 19.3 修改分区键
 
@@ -1892,7 +2492,7 @@ MODE REBUILD;
 | 页面类型 | `pkg/src/kernel/buffer/knl_page.h` | 新 `PAGE_TYPE_GRAPH_*` |
 | Catalog | `pkg/src/kernel/catalog/` | 图、Label Set、ID Map、分区 |
 | 集群 | `pkg/src/cluster/` | 图页 CR、批量预取、分区路由 |
-| Redo/Undo | `pkg/src/kernel/persist/`、`pkg/src/kernel/xact/` | 图日志和回滚 |
+| Redo/Undo | `pkg/src/kernel/persist/`、`pkg/src/kernel/xact/` | 新的图日志类型区间和回滚；固定槽更新不能复用 `RD_HEAP_*` |
 | SQL 前端 | `pkg/src/ogsql/cypher/` | 独立 OpenCypher Parser、Binder、Lowering |
 | 优化与执行 | `pkg/src/ogsql/optimizer/`、`executor/` | Expand、Path、分区交换 |
 | 运维 | `pkg/src/ogbox/` | 页面转储和校验 |
@@ -1909,17 +2509,20 @@ status_t graph_validate_edge_def(const graph_edge_def_t *def);
 status_t graph_make_vid(uint16 vpart, uint32 sequence, uint16 generation,
     graph_vid_t *vid);
 status_t graph_vertex_locate(graph_handle_t *handle,
-    graph_vid_t vid, graph_slot_location_t *location);
+    graph_vid_t vid, uint8 access_mode, graph_mapping_guard_t *guard,
+    graph_slot_location_t *location);
 status_t graph_make_eid(const graph_id_layout_t *id_layout,
     uint16 vpart, uint32 logical_page_no, uint8 slot_id, uint16 generation,
     graph_eid_t *eid);
 status_t graph_decode_eid(const graph_id_layout_t *id_layout,
     graph_eid_t eid, graph_eid_fields_t *fields);
 status_t graph_edge_locate(graph_handle_t *handle,
-    graph_eid_t eid, graph_slot_location_t *location);
-status_t graph_page_map_resolve(graph_handle_t *handle, uint16 vpart,
-    uint8 segment_kind, uint32 logical_page_no,
-    graph_page_map_entry_t *entry);
+    graph_eid_t eid, uint8 access_mode, graph_mapping_guard_t *guard,
+    graph_slot_location_t *location);
+status_t graph_page_resolve(graph_handle_t *handle, uint16 vpart,
+    uint8 segment_kind, uint32 logical_page_no, uint8 access_mode,
+    graph_mapping_guard_t *guard, graph_page_resolution_t *resolution);
+void graph_mapping_guard_release(graph_mapping_guard_t *guard);
 status_t graph_adj_resolve(graph_handle_t *handle, graph_vid_t owner_vid,
     uint8 direction, uint8 mode, graph_adj_locator_t locator,
     knl_scn_t query_scn, graph_adj_object_view_t *object);
@@ -1938,7 +2541,7 @@ status_t graph_expand(graph_handle_t *handle,
     const graph_expand_req_t *request, graph_expand_result_t *result);
 ```
 
-所有定位API显式接收Graph Handle，因为相同的64-bit VID/EID值在不同Graph中可以合法存在。`graph_adj_open()` 在内部复制Vertex Descriptor后释放Vertex Page latch，再解析Directory/Data Page；`graph_adj_close()` 必须释放当前Buffer、CR Page和远程预取资源。
+`access_mode` 固定为 `GRAPH_ACCESS_READ` 或 `GRAPH_ACCESS_WRITE`。所有定位API显式接收Graph Handle，因为相同的64-bit VID/EID值在不同Graph中可以合法存在。Reader成功定位后，在Mapping Guard保护下进入并Pin Buffer、校验Page Identity和 `mapping_version`，然后可以释放Guard。Writer必须继续持有Guard直到取得DRC X和Page Latch、再次校验Version、完成修改并生成Redo，之后才能调用 `graph_mapping_guard_release()`。`graph_adj_open()` 在内部复制Vertex Descriptor后释放Vertex Page latch，再解析Directory/Data Page；`graph_adj_close()` 必须释放当前Buffer、CR Page、Mapping Guard和远程预取资源。
 
 ID构造函数返回 `status_t`，在写入输出参数前校验generation非0、保留值、Virtual Partition范围以及 `logical_page_no <= 0xFFFFFF`；禁止静默截断超出持久化位宽的输入。`graph_adj_resolve()` 使用 `query_scn` 构造Directory Object的CR版本并决定Migration old/new root。
 
@@ -1950,7 +2553,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 
 - 持久化结构、ID、布局校验和页面容量计算；
 - Catalog、ID Map、Label Set；
-- 顶点、规范边、DIRECT/PACKED 邻接读写；
+- 顶点、规范边、DIRECT、PACKED、EXTERNAL 邻接读写；
 - EDGE/OUT/IN Inline Properties；
 - 基本 OpenCypher 读查询和有限变长路径；
 - 语句级一致读；
@@ -1982,7 +2585,8 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 槽宽、属性宽度或页面容量超限；
 - 不支持的编码、邻接模式或分片策略；
 - generation 不匹配；
-- Graph、Segment、Virtual Partition、Logical Page、Map Epoch、Page Generation、页面类型或布局版本不匹配；
+- Graph、Segment、Virtual Partition、Logical Page、Mapping Epoch、Page Generation、页面类型、Identity Version或Page Type Format Version不匹配；
+- Extent不是PRESENT、已经RETIRED、页偏移越界或Physical Extent跨Datafile边界；
 - 悬空 VID、EID 或 RowID；
 - OUT/IN Mode与Descriptor Root类型不匹配；
 - Adjacency owner、方向、Edge Type、Directory Version或Entry长度不匹配；
@@ -1999,30 +2603,73 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 24-bit Edge逻辑页号、8-bit Slot和16-bit generation边界；
 - generation 不匹配；
 - 所有持久化结构的大小和偏移；
-- `graph_segment_head_t`、Page Map和公共Page Identity的编码、恢复及反向校验；
-- Radix-256 Page Map跨层查找、Map Epoch变化和陈旧物理映射拒绝；
+- `graph_segment_head_t`、Extent Map和公共Page Identity的编码、恢复及反向校验；
+- `graph_page_identity_t` V1固定24B，前4B兼容前缀、`identity_bytes`边界与4B对齐校验；
+- 未来V2读取器读取正式V1 Identity，V1读取器拒绝未知Identity Version；此前32B无版本草案只允许迁移或重建；
+- Segment、Extent Map、Vertex、Edge、Adjacency Directory和Adjacency Data格式版本独立演进，升级其中一种不改变其他Page Type版本；
+- Identity及每种Page Type新版本在全体可接管节点支持前禁止写入；
+- 各Page Type Header的注册版本与精确 `header_bytes` 匹配、4B对齐、页面边界、追加字段定位和未知Format Version拒绝；
+- Extent主路径直接计算、Extent级Radix跨层查找和陈旧Mapping Epoch拒绝；
+- Logical Page边界 `0/0xFFFFFF/0xFFFFFFFF` 的64-bit覆盖范围计算；
+- Extent Entry的PRESENT/RETIRED、页偏移、Page Count、Extent Epoch和Allocation Generation校验；
+- Extent Cache中 `mapping_version` 相同但 `allocation_generation` 不同的Entry必须失效；
+- DRC Extent资源代次不匹配，以及Physical Extent回收重分配后的旧缓存和延迟响应必须被拒绝；
+- 两个Extent并发修改同一已存在Extent Map Leaf时必须通过Page Latch串行化；
+- 并发扩展Extent级Radix时，完整路径COW、唯一Root Reference CAS和失败重试；
+- 复制期间并发写冻结、Resolve与Publish竞争及Mapping Guard读写互斥；
+- Writer持有Mapping S Guard直到DRC X、Page Latch、页面修改和Redo生成全部完成；
+- Extent翻译缓存失效确认和 `mapping_version` 校验；
+- Extent级Radix增长时新路径节点先持久化、Root作为唯一发布点，以及Crash后旧树或新树原子可达；
+- 新页Redo、映射发布Redo、Commit/Flush各Crash Point恢复到完整旧映射或完整新映射；
+- 进入易失MAPPING_BUSY后Crash不会在持久化Entry中留下该状态；
+- 两个整Extent搬迁并发时按Logical Extent串行化或CAS重试；
+- DRC延迟响应、DCS传输、Buffer Pin和Mapping Guard未结束前禁止复用旧Physical Page；
+- Partial Extent、Checked Page-ID Addition和Datafile边界；
+- extent/ref/chunk Epoch及mapping_version回绕静默或退休；
+- Standby ABR将Graph坏页修复到原Buffer与原 `page_id`，不更新Extent Map；
+- Backup + Redo ABR只接受同一 `page_id`，并由 `RESTORE FLUSHPAGE` 写回原file/page offset；
+- 数据页、Segment Head、Root/Child Extent Map页分别从Extent Entry、Catalog、Segment Head Root、Parent Reference构造ABR预期身份；
+- ABR只接受集群兼容矩阵支持的Identity/Page Type Format Version组合，并使用注册的精确Header长度解析；
+- Graph各Page Type在Checksum重算和任何写回前，按ABR请求上下文校验完整Page Identity、Page Type、PCN和Page ID；不匹配时拒绝写回；
+- Graph各Page Type完成ABR原位写回后再次通过Page Identity与Checksum校验；
+- 原位置永久不可写时由存储层坏块重映射或整Extent搬迁，第一期不存在单页映射覆盖；
+- Phase 1拒绝启用 `GRAPH_MAP_FEATURE_PAGE_EXCEPTION`，不注册或分配对应Page Type及持久化结构；
 - 8KB 页面容量；
 - 固定槽页ITL区域耗尽时不移动Slot Area；
+- Vertex/Edge Allocation Bitmap位于固定ITL数组和Slot Array之间，Offset/Bytes公式及页面边界校验；
+- Allocation Bitmap的LSB-first位序、尾部保留bit为1、`used_slots`仅统计有效Slot；
+- `free_hint`陈旧、回绕、满页 `UINT16_MAX`、删除后降低Hint及越界损坏校验；
+- Slot初始化、Bitmap置位、`used_slots/free_hint`更新的Redo原子性；
+- 删除事务提交且不可回滚、旧快照结束、Undo不再引用后，清bit、递减计数和降低Hint的Redo原子性；
+- generation为 `UINT16_MAX` 的Vertex/Edge Slot转为RETIRED，保持Bitmap bit和 `used_slots`且永久不可复用；
 - sequence 到页和槽的定位；
 - 图级0/8/16B Vertex Inline预算及48/56/64B Slot定位；
+- 三种Vertex Slot的48B公共前缀字段偏移完全一致，8B/16B Inline Payload都从offset 48开始；
 - OUT/IN Mode Nibble独立变化及两个12B Descriptor的结构一致性；
 - Descriptor Root Locator无效值、Page Root、Object Root、generation不匹配和回绕退休；
+- Adjacency/Directory Logical Page回收后永久退休，Object Slot仅在原页面身份内复用；
 - 40/48/56/64B Edge Page的页内固定槽定位；
-- Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Page Layout Version和Slot宽度交叉校验；
-- Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许物理搬迁，并要求Map Epoch原子递增；Slot generation回绕时退休；
+- Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Edge Format Version和Slot宽度交叉校验；
+- Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许整Extent物理搬迁，并要求Extent Epoch原子递增；Slot generation回绕时退休；
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
+- Adjacency Directory Header为36B，前2B兼容前缀不变，`directory_version` 仍为32 bit；
+- 目录链只有 `next_page`，拆分和合并从已发布根扫描前驱，旧引用退出前不回收页面；
+- `live_object_count` 为16 bit且不超过 `object_count`，回绕被拒绝；读取按 `object_count` 扫描全部Slot；
+- Directory页8 bit `flags` 的保留位为1时拒绝解析；
+- `directory_version` 在目录页和邻接数据页都固定为32 bit；16 bit回绕不得被当作当前目录，旧引用未退出时禁止复用；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
 - Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
 - Directory/Adjacency Side Slot整理不改变object_slot和generation；
 - OUT Entry保存dst VID、IN Entry保存src VID，并按对方VID跨分区分桶；
-- Directory计数、Zone Map和Bloom摘要陈旧时只能增加扫描、不能漏结果；
-- Property Row反向校验Graph、Owner ID、generation和Schema Layout；
-- 多 Label Set；
-- TIME32/TIME64 的边界、时区、单位和不可变 Base；
+- Directory计数和 `live_count` 陈旧时只能增加扫描、不能漏结果；
+- Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
+- Property Row通过系统列反向校验 Owner ID、generation 和 Schema Layout；
+- 多 Label 的 32 bit 复用：常用 Label 内联位图、外部集合保存完整成员、`common_ordinal` 不复用、`0x80000000` 拒绝；
+- `INLINE_TIME32`/`INLINE_TIME64` 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
-- WARNING 状态 `10` 不能被 Zone Map 错误排除，并能批量回读规范值；
+- WARNING 状态 `10` 必须逐Entry识别，不能被页面级判断错误排除，并能批量回读规范值；
 - 任意确定性表达式的规范化匹配，以及非确定性表达式拒绝；
 - `HASH32_VERIFY` 的多列、NULL、类型、Collation、参数顺序和碰撞后原值验证；
 - Hash 算法版本在不同节点和恢复后的稳定性；
@@ -2038,18 +2685,28 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | VID 使用 16+40+8 | 16+32+16 | 为高频删除提供足够 generation |
 | VID和EID使用相同的16+32+16解释 | VID为16+32+16；EID为16+24+8+16 | EID需要同时编码逻辑页与页内槽 |
 | 固定 128B 槽和 4–8 条内嵌边作为默认 | 图级Vertex Inline为0/8/16B，默认0B；第一期不在Vertex Slot中保存Inline Edge | 保证同一图槽宽固定，并控制百亿顶点空间和顶点页争用 |
+| Vertex Inline插在Meta与Property RowID之间 | 三档Vertex Slot共享48B公共前缀，Inline Payload统一追加在尾部 | 固定Property RowID和OUT/IN Descriptor偏移，复用访问、恢复与校验代码 |
 | 所有Canonical Edge固定64B | Page内固定，按Layout使用40/48/56/64B | 保持直接定位，同时提高无属性边和窄边的页面密度 |
 | 邻接项使用 edge_token | 普通邻接项使用完整 EID | 降低重建和恢复复杂度 |
 | 用户配置 Covering Properties | 用户配置 EDGE/OUT/IN INLINE | 直接表达三个物理副本 |
 | 每个顶点独立 Directory Page | DIRECT、PACKED、EXTERNAL、SHARDED四种形态 | 低度顶点避免额外页面，超级节点可独立分片 |
 | 图分区绑定一个 DRC 分区 | 两类分区正交 | DRC Master 可分散，本地性由 Page Owner 保证 |
-| 单 Label | Label Set | 支持一人多角色 |
+| 单 Label | 32 bit `label_set_id` 复用为常用 Label 位图，放不下时使用外部 Label Set | 常见角色组合直接在顶点槽判断，同时支持任意 Label 组合 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
 | 业务 ID 直接乘槽宽定位 | External ID 映射到 VID | 业务 ID 稀疏且需要稳定代次 |
-| `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | TIME32/TIME64 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
+| `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | `INLINE_TIME32`/`INLINE_TIME64` 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
+| Inline 时间类型使用 `TIME32`/`TIME64` | 全部 Inline CAST 目标类型使用 `INLINE_` 前缀 | 与属性列上的 `TIMESTAMP`、`INTEGER` 等普通 SQL 类型区分 |
 | 动态时间 Base 或 Page Base | Schema 中的明确不可变时间字面量 | 更新和迁移不会改变 Inline 语义 |
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
+| 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
+| Phase 1邻接页持久化Zone Map、Bloom和失效掩码 | 56B Header只保留 `free_begin/free_end`；摘要延后到Format V2 | 8KB页面直接扫描成本较低，避免未经基准验证的摘要维护、删除重建和MVCC复杂度 |
+| Directory Header按对齐空隙穿插字段 | 36B Header，删除 `directory_level` 和 `prev_page` | 第一期不是多层目录树；后继链从已发布根正向到达全部页面，减少拆分时要原子更新的链接 |
+| Directory `live_object_count` 使用32 bit、`flags` 使用16 bit | 两者分别缩为16 bit和8 bit | 32KB页面最多约1361个最小目录对象；页级标志只校验模式，未知保留位拒绝解析 |
+| `directory_version` 缩为16 bit | 目录页和邻接数据页都固定使用32 bit | 16 bit回绕会把旧目录页误认为当前目录，造成邻居重复、丢失或写入旧页面 |
+| 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
+| 图单独指定 `PAGE_SIZE`，DDL 声明 `ZONEMAP` | 图使用数据库页大小；第一期邻接页不保存 Zone Map | Buffer、表空间和 Redo 只有一个页大小；页面级摘要已经推迟到 Format V2 |
+| 属性行私有 24B 图身份头 | 普通 PCR 堆表加 `owner_id`、`owner_generation`、`schema_layout_id` 系统列 | 复用行格式、加列、LOB 和迁移链，避免堆扫描把私有头当成用户列 |
 
 ## 25. 总体确认清单
 
@@ -2062,17 +2719,19 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. OUT/IN各使用相同的12B Descriptor但独立Mode；目录按Edge Type路由，并选择DIRECT、PACKED、EXTERNAL或SHARDED。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。
-8. 多 Label 使用 Label Set 和 ID Namespace。
+8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用保存完整成员的外部 Label Set；ID Namespace 保持不变。
 9. 超级节点按邻居哈希等方式分片。
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
-13. 第一期时间编码只提供显式 Base 的 TIME32/TIME64；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
+13. 第一期时间编码只提供显式 Base 的 `INLINE_TIME32`/`INLINE_TIME64`；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
 14. Vertex、Edge 和 OUT/IN Inline 投影使用两位状态编码，严格区分 NULL、有效值和规范原值回读。
-15. Segment使用Radix Page Map将稳定Logical Page映射到Physical Page，所有Graph Page保存并反向校验公共身份。
+15. Segment只使用Chunked Extent Map，超大或稀疏Segment可用Extent级Radix容器；坏页复用现有原位ABR，原位置永久不可写时使用存储层重映射或整Extent搬迁；所有Graph Page保存并反向校验公共身份。
 16. 固定Vertex/Edge Slot Page预留不可增长的ITL区域；Adjacency/Directory使用带generation和ITL的8B Side Slot。
 17. OUT Entry保存完整dst VID，IN Entry保存完整src VID；跨分区Frontier根据Entry中的VID分桶。
-18. Property Row复用PCR Heap，但反向保存并校验Graph、Owner ID、generation和Schema Layout。
+18. Property Row复用普通PCR Heap表。系统列保存Owner ID、generation和Schema Layout，不插入私有24B行前缀。
+19. 公共Graph Page Identity固定24B V1兼容前缀；Segment、Extent Map、Vertex、Edge和两类Adjacency页面在各自Header中独立管理8-bit Format Version与Header长度。
+20. Phase 1 Adjacency Data Header为56B，只使用 `free_begin/free_end` 管理变长空间；Zone Map、Bloom Filter和页面级失效掩码延后到独立Format V2，并通过整页重写启用。
 
 以下参数保留为上线前基准测试项，不改变上述结构：
 
@@ -2081,4 +2740,5 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 各 Edge Type 的 OUT/IN 属性编码；
 - 超级节点晋升阈值；
 - 拉页与移动计算的切换阈值；
+- Logical Extent页数；
 - 最终一致模式允许的陈旧窗口。
