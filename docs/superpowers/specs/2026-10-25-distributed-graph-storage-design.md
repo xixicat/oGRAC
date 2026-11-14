@@ -1466,17 +1466,19 @@ Directory计数和Data Page的 `live_count` 是保守摘要，不决定MVCC可�
 
 ### 11.4 时间 Inline 类型
 
-第一期不提供 `UINT32_DELTA`。只提供 `TIME32` 和 `TIME64`：
+第一期不提供 `UINT32_DELTA`。只提供 `INLINE_TIME32` 和 `INLINE_TIME64`。所有 Inline CAST 目标类型都使用 `INLINE_` 前缀，避免与顶点、边属性声明中的 `TIMESTAMP`、`INTEGER` 等普通 SQL 类型重名。`HASH32_VERIFY` 是预过滤函数，可见结果类型仍是 `INTEGER`，不是另一种列类型。
+
+时间投影写成：
 
 ```sql
-CAST(timestamp AS TIME32 WITH (
+CAST(timestamp AS INLINE_TIME32 WITH (
     BASE = TIMESTAMP '2020-01-01 00:00:00+00:00',
     UNIT = SECOND,
     OVERFLOW = REJECT
 ))
 ```
 
-`TIME32` 保存相对显式 Base 的有符号 32-bit 时间差，`TIME64` 保存有符号 64-bit 时间差。`BASE` 和 `UNIT` 必填：
+`INLINE_TIME32` 保存相对显式 Base 的有符号 32-bit 时间差，`INLINE_TIME64` 保存有符号 64-bit 时间差。`BASE` 和 `UNIT` 必填：
 
 - `BASE` 必须是带明确时区或已经规范化时区的时间字面量；
 - 禁止 `GRAPH_EPOCH`、`now()`、`current_time`、序列值、会话变量等动态来源；
@@ -1527,7 +1529,7 @@ encoded = CAST(expression - base AS inline_numeric_type)
 
 ### 11.6 Overflow 语义与失效值
 
-所有 `TIME32`、`TIME64` 和 `INLINE_*` 数值类型支持：
+所有 `INLINE_TIME*`、`INLINE_INT*`、`INLINE_UINT*` 和 `INLINE_FP*` 目标类型支持：
 
 ```text
 OVERFLOW = REJECT | WARNING
@@ -1900,7 +1902,7 @@ STORAGE (
         CAST(user_level AS INLINE_INT32 WITH (
             OVERFLOW = REJECT
         )) AS user_level,
-        CAST(last_active_time AS TIME64 WITH (
+        CAST(last_active_time AS INLINE_TIME64 WITH (
             BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
             UNIT = MICROSECOND,
             OVERFLOW = REJECT
@@ -1953,7 +1955,7 @@ FROM User TO Advertisement (
 STORAGE (
     EDGE_SLOT_PROFILE = AUTO,
     EDGE INLINE PROPERTIES (
-        CAST(timestamp AS TIME64 WITH (
+        CAST(timestamp AS INLINE_TIME64 WITH (
             BASE = TIMESTAMP '1970-01-01 00:00:00+00:00',
             UNIT = MICROSECOND,
             OVERFLOW = REJECT
@@ -1969,7 +1971,7 @@ STORAGE (
         )) AS device_type
     ),
     OUT INLINE PROPERTIES (
-        CAST(timestamp AS TIME32 WITH (
+        CAST(timestamp AS INLINE_TIME32 WITH (
             BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
             UNIT = SECOND,
             OVERFLOW = WARNING
@@ -1985,7 +1987,7 @@ STORAGE (
         )) AS device_type
     ),
     IN INLINE PROPERTIES (
-        CAST(timestamp AS TIME32 WITH (
+        CAST(timestamp AS INLINE_TIME32 WITH (
             BASE = TIMESTAMP '2026-01-01 00:00:00+00:00',
             UNIT = SECOND,
             OVERFLOW = WARNING
@@ -2007,7 +2009,7 @@ STORAGE (
 
 `detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
 
-例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的TIME32秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
+例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的 `INLINE_TIME32` 秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
 ### 17.5 超级节点策略
 
@@ -2321,7 +2323,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
 - Property Row反向校验Graph、Owner ID、generation和Schema Layout；
 - 多 Label Set；
-- TIME32/TIME64 的边界、时区、单位和不可变 Base；
+- `INLINE_TIME32`/`INLINE_TIME64` 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
 - WARNING 状态 `10` 必须逐Entry识别，不能被页面级判断错误排除，并能批量回读规范值；
@@ -2349,7 +2351,8 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 单 Label | Label Set | 支持一人多角色 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
 | 业务 ID 直接乘槽宽定位 | External ID 映射到 VID | 业务 ID 稀疏且需要稳定代次 |
-| `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | TIME32/TIME64 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
+| `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | `INLINE_TIME32`/`INLINE_TIME64` 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
+| Inline 时间类型使用 `TIME32`/`TIME64` | 全部 Inline CAST 目标类型使用 `INLINE_` 前缀 | 与属性列上的 `TIMESTAMP`、`INTEGER` 等普通 SQL 类型区分 |
 | 动态时间 Base 或 Page Base | Schema 中的明确不可变时间字面量 | 更新和迁移不会改变 Inline 语义 |
 | Hash 值直接参与等值判断 | `HASH32_VERIFY` 预过滤后校验原值 | 处理 32-bit Hash 碰撞 |
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
@@ -2376,7 +2379,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
-13. 第一期时间编码只提供显式 Base 的 TIME32/TIME64；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
+13. 第一期时间编码只提供显式 Base 的 `INLINE_TIME32`/`INLINE_TIME64`；数值使用通用 Inline CAST；Hash 使用 `HASH32_VERIFY` 并强制原值校验。
 14. Vertex、Edge 和 OUT/IN Inline 投影使用两位状态编码，严格区分 NULL、有效值和规范原值回读。
 15. Segment只使用Chunked Extent Map，超大或稀疏Segment可用Extent级Radix容器；坏页复用现有原位ABR，原位置永久不可写时使用存储层重映射或整Extent搬迁；所有Graph Page保存并反向校验公共身份。
 16. 固定Vertex/Edge Slot Page预留不可增长的ITL区域；Adjacency/Directory使用带generation和ITL的8B Side Slot。
