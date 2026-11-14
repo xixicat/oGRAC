@@ -740,7 +740,7 @@ typedef struct st_graph_slot_location {
 typedef struct st_graph_vertex_meta {
     uint16 flags;
     uint16 generation;
-    uint32 label_set_id;
+    uint32 label_set_id;           /* bit31=0 常用Label位图；bit31=1 外部Label Set */
     uint16 schema_layout_id;
     uint16 inline_property_state_bitmap;
     uint8  itl_id;
@@ -766,7 +766,7 @@ bit 9–15 reserved
 
 删除标记受MVCC保护，旧快照结束后才允许回收。读取VID时必须同时满足 `ALLOCATED`、非可见删除且 `VID.generation == vertex_meta.generation`。
 
-`label_set_id` 指向一组 Label。`schema_layout_id` 决定当前图级预算中的热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
+`label_set_id` 复用这 32 bit 保存多 Label，编码见第 15 节。`schema_layout_id` 决定当前图级预算中的热属性如何解码。`inline_property_state_bitmap` 使用两位表示一个 Inline 投影的状态：
 
 ```text
 00：NULL或属性不存在
@@ -1674,30 +1674,60 @@ PCR MVCC可见性
 
 ## 15. 多 Label
 
-`label_set_id` 指向复用的 Label 集合：
+`vertex_meta.label_set_id` 的 32 bit 同时承担两种编码，最高位区分模式：
 
 ```text
-42 → {User, Person, Employee, Manager}
-43 → {User, Person, Employee}
+bit 31 = 0    常用 Label 内联位图
+  bits 0–30   common_ordinal 0–30，一位对应一个常用 Label
+  0           当前没有任何 Label
+
+bit 31 = 1    外部 Label Set
+  bits 0–30   非 0 的 label_set_id
+  0x80000000  非法
+```
+
+一个图最多注册 31 个常用 Label。创建顶点类型或 `CREATE VERTEX TAG ... COMMON` 时分配 `common_ordinal`，序号写入 `SYS_GRAPH_LABEL` 后不可改变、不可复用。未标记 `COMMON` 的 Label 没有序号。31 个序号用完或退休后，新 Label 只能进入外部 Label Set。第一期不允许把已有 Label 在常用与非常用之间在线转换，因为这会改变所有顶点槽中这 32 bit 的含义。
+
+顶点当前的 Label 全部属于常用集合时，直接把对应位写入槽内，不创建 Label Set 行，判断时也不查 Dictionary Cache。例如 `User=0`、`Person=1`、`Employee=2`、`Manager=3`：
+
+```text
+{User, Person, Employee, Manager} = 0x0000000F
+{User, Person, Employee}          = 0x00000007
+```
+
+只要集合中有一个非常用 Label，低 31 位就不再是位图，而是外部集合编号。外部集合保存完整成员，包含其中的常用 Label。顶点同时拥有常用 `User` 和非常用 `Contractor` 时写成 `0x80000000 | set_id`，该 `set_id` 的成员是 `{User, Contractor}`。不能只把非常用 Label 放进外部集合，否则常用 Label 的判断会丢失。
+
+从已知 VID 判断一个或多个 Label 时只读取这一个 32 bit 字：
+
+```text
+word = label_set_id
+bit31 = 0:
+    Label 没有 common_ordinal → 不包含
+    否则测试 bits[common_ordinal]
+    多个常用 Label 一次做位图包含判断
+bit31 = 1:
+    用 bits 0–30 查询 Dictionary Cache
+    Cache 保存该集合的完整成员位图
+    常用 Label 和非常用 Label 都在这张位图中判断
 ```
 
 Catalog：
 
 ```text
-SYS_GRAPH_LABEL
-SYS_GRAPH_LABEL_SET
+SYS_GRAPH_LABEL                 /* 含不可变 common_ordinal，NULL 表示非常用 */
+SYS_GRAPH_LABEL_SET             /* 只保存无法放入内联位图的完整集合 */
 SYS_GRAPH_LABEL_SET_MEMBER
 ```
 
-Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 Label 时执行一次位图包含判断。
+外部 `label_set_id` 按完整成员复用，集合内容不可变。编号 0 保留。已发布给顶点槽、Undo、快照或缓存的编号不得改指另一组成员；31 bit 编号耗尽时拒绝新的不同集合，禁止回绕。
 
-从 Label 扫描全图时使用按分区组织的倒排索引：
+从 Label 扫描全图时仍使用按分区组织的倒排索引。内联位图只加速已知 VID 的判断，不代替倒排：
 
 ```text
 (graph_id, label_id, virtual_partition_id) → compressed VID list
 ```
 
-添加或删除 Tag 时创建或复用新的 Label Set，事务内更新顶点槽和倒排索引。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
+添加或删除 Tag 时在同一事务中计算新的完整集合，并更新顶点槽与倒排索引。新集合能放入常用位图时写回 bit31 为 0 的字；否则创建或复用外部 Label Set，再写回 `0x80000000 | set_id`。旧快照通过 CR 读取旧字。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
 
 ## 16. 复杂查询的遍历流程
 
@@ -1713,7 +1743,7 @@ Dictionary Cache 保存 `label_set_id → bitmap`。从已知 VID 判断多个 L
  → 02/04/05 User Vertex Slot
 ```
 
-读取 `06.label_set_id`，确认包含 `User`。
+读取 `06.label_set_id`。`User` 为常用 Label 且 bit31 为 0 时，直接测试它的 `common_ordinal`；bit31 为 1 时，用低 31 位读取外部集合的完整成员并确认包含 `User`。
 
 ### 16.2 第一跳 CLICKED
 
@@ -1912,26 +1942,29 @@ STORAGE (
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。
+DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。顶点类型名同时注册为 Label。广告图示例将 `User` 标为 `COMMON` 并取得序号 0，后续 Tag 再依次取得序号。
 
 第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边由Packed Small Adjacency Page承载。
 
 ### 17.3 Tag
 
 ```sql
-CREATE VERTEX TAG Person FOR TYPE User IN GRAPH ad_graph;
+CREATE VERTEX TAG Person FOR TYPE User IN GRAPH ad_graph
+COMMON;
 
-CREATE VERTEX TAG Employee FOR TYPE User IN GRAPH ad_graph (
+CREATE VERTEX TAG Employee FOR TYPE User IN GRAPH ad_graph
+COMMON (
     employee_no VARCHAR(32),
     department_id BIGINT
 );
 
-CREATE VERTEX TAG Manager FOR TYPE User IN GRAPH ad_graph (
+CREATE VERTEX TAG Manager FOR TYPE User IN GRAPH ad_graph
+COMMON (
     management_level SMALLINT
 );
 ```
 
-Tag 属性默认进入属性行。
+`COMMON` 为该 Tag 分配不可变的常用 Label 序号，使只包含这些 Label 的顶点把成员放进 `label_set_id` 的低 31 位。Tag 属性默认进入属性行。
 
 ```cypher
 MATCH (u:User {external_id: $id})
@@ -2322,7 +2355,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Directory计数和 `live_count` 陈旧时只能增加扫描、不能漏结果；
 - Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
 - Property Row反向校验Graph、Owner ID、generation和Schema Layout；
-- 多 Label Set；
+- 多 Label 的 32 bit 复用：常用 Label 内联位图、外部集合保存完整成员、`common_ordinal` 不复用、`0x80000000` 拒绝；
 - `INLINE_TIME32`/`INLINE_TIME64` 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
@@ -2348,7 +2381,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 用户配置 Covering Properties | 用户配置 EDGE/OUT/IN INLINE | 直接表达三个物理副本 |
 | 每个顶点独立 Directory Page | DIRECT、PACKED、EXTERNAL、SHARDED四种形态 | 低度顶点避免额外页面，超级节点可独立分片 |
 | 图分区绑定一个 DRC 分区 | 两类分区正交 | DRC Master 可分散，本地性由 Page Owner 保证 |
-| 单 Label | Label Set | 支持一人多角色 |
+| 单 Label | 32 bit `label_set_id` 复用为常用 Label 位图，放不下时使用外部 Label Set | 常见角色组合直接在顶点槽判断，同时支持任意 Label 组合 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
 | 业务 ID 直接乘槽宽定位 | External ID 映射到 VID | 业务 ID 稀疏且需要稳定代次 |
 | `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | `INLINE_TIME32`/`INLINE_TIME64` 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
@@ -2374,7 +2407,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. OUT/IN各使用相同的12B Descriptor但独立Mode；目录按Edge Type路由，并选择DIRECT、PACKED、EXTERNAL或SHARDED。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。
-8. 多 Label 使用 Label Set 和 ID Namespace。
+8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用保存完整成员的外部 Label Set；ID Namespace 保持不变。
 9. 超级节点按邻居哈希等方式分片。
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
