@@ -1225,34 +1225,48 @@ free space
 page_tail_t
 ```
 
-类型扩展头为48B：
+类型扩展头为36B：
 
 ```c
 typedef struct st_graph_adj_dir_page_header {
     uint8  adj_dir_format_version;  /* offset 0,  V1=1 */
-    uint8  header_bytes;            /* offset 1,  V1=48 */
+    uint8  header_bytes;            /* offset 1,  V1=36 */
     uint8  direction;               /* offset 2 */
-    uint8  directory_level;         /* offset 3 */
+    uint8  flags;                   /* offset 3 */
 
     graph_vid_t owner_vid;          /* offset 4 */
 
-    uint16 object_count;            /* offset 12 */
-    uint16 flags;                   /* offset 14, PACKED/EXTERNAL/SHARD/MIGRATION */
-    uint32 live_object_count;       /* offset 16 */
-    uint32 directory_version;       /* offset 20，固定32 bit */
+    uint16 object_count;            /* offset 12，Side Slot高水位 */
+    uint16 live_object_count;       /* offset 14 */
+    uint32 directory_version;       /* offset 16，固定32 bit */
 
-    uint16 free_begin;              /* offset 24 */
-    uint16 free_end;                /* offset 26 */
-    uint8  itl_count;               /* offset 28 */
-    uint8  itl_capacity;            /* offset 29 */
-    uint16 reserved_zero;           /* offset 30 */
+    uint16 free_begin;              /* offset 20 */
+    uint16 free_end;                /* offset 22 */
+    uint8  itl_count;               /* offset 24 */
+    uint8  itl_capacity;            /* offset 25 */
+    uint16 reserved_zero;           /* offset 26 */
 
-    graph_adj_locator_t next_page;  /* offset 32 */
-    graph_adj_locator_t prev_page;  /* offset 40 */
-} graph_adj_dir_page_header_t;      /* 48B */
+    graph_adj_locator_t next_page;  /* offset 28 */
+} graph_adj_dir_page_header_t;      /* 36B */
 ```
 
-前2B兼容前缀保持不变。其余字段按“页面身份、对象统计、页内空间、目录页链”分组，所有字段自然满足4B对齐，没有隐式填充。`free_begin/free_end` 与 `itl_count/itl_capacity` 集中描述可变对象区，`next_page/prev_page` 集中描述同一目录链。该格式尚未落盘，因此直接作为V1布局，不为此次重排增加Format Version。
+前2B兼容前缀保持不变。`flags` 使用紧随前缀的第3字节，不占用兼容前缀。字段按“页面身份、对象统计、页内空间、后继页”排列，自然满足4B对齐，没有隐式填充。该格式尚未落盘，因此直接作为V1布局。
+
+V1不保存 `directory_level` 和 `prev_page`。第一期目录不是多层树；一个顶点的一个方向从已发布根沿 `next_page` 到达该方向的全部目录页，空Locator表示链尾。这与邻接数据页只保留 `next_page` 的规则相同。拆分页或合并页时，从已发布根扫描得到前驱，只修改前驱的 `next_page`，并在Undo中记录旧值；不能从链中页反向查找前驱。扫描必须校验 `owner_vid`、`direction`、`directory_version` 和 Page Generation，并拒绝回环。所有仍被旧快照、缓存、Buffer Pin或DRC引用的页面，在引用退出前不得回收。
+
+`object_count` 是包含已删除Slot的高水位。读取枚举全部 `object_count` 个Side Slot，不能用 `live_object_count` 提前停止。`live_object_count` 必须小于或等于 `object_count`，只用于统计和一致性校验；两者不一致时以Slot数组为准并继续完整扫描。oGRAC页面最大32KB，页头、24B身份、36B目录头和页尾至少占用100B，最小目录对象为8B Side Slot加16B Payload。因此一页最多约1361个对象，远小于65535。两个计数都固定16 bit，增加到 `UINT16_MAX` 时返回错误，禁止回绕成0。
+
+`flags` 固定8 bit：
+
+```text
+bit 0  PACKED
+bit 1  EXTERNAL
+bit 2  SHARDED
+bit 3  MIGRATING
+bit 4–7 reserved，V1必须为0
+```
+
+`PACKED`、`EXTERNAL`、`SHARDED` 互斥，`MIGRATING` 可以与其中一位同时置位。页级标志只交叉校验顶点描述符中的方向模式，边和目录项本身仍在对象与Side Slot中。V1读到保留位为1时把页面视为损坏，不能忽略后继续解析。
 
 目录页使用与Adjacency Data Page相同的空间规则：
 
@@ -2294,7 +2308,10 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许整Extent物理搬迁，并要求Extent Epoch原子递增；Slot generation回绕时退休；
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
-- Adjacency Directory Header按身份、统计、空间和页链分组，48B自然对齐且前2B兼容前缀不变；
+- Adjacency Directory Header为36B，前2B兼容前缀不变，`directory_version` 仍为32 bit；
+- 目录链只有 `next_page`，拆分和合并从已发布根扫描前驱，旧引用退出前不回收页面；
+- `live_object_count` 为16 bit且不超过 `object_count`，回绕被拒绝；读取按 `object_count` 扫描全部Slot；
+- Directory页8 bit `flags` 的保留位为1时拒绝解析；
 - `directory_version` 在目录页和邻接数据页都固定为32 bit；16 bit回绕不得被当作当前目录，旧引用未退出时禁止复用；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
 - Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
@@ -2338,7 +2355,8 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
 | 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
 | Phase 1邻接页持久化Zone Map、Bloom和失效掩码 | 56B Header只保留 `free_begin/free_end`；摘要延后到Format V2 | 8KB页面直接扫描成本较低，避免未经基准验证的摘要维护、删除重建和MVCC复杂度 |
-| Directory Header按对齐空隙穿插字段 | 48B Header按身份、统计、空间和页链分组 | 保持自然4B对齐，同时让相关字段连续、偏移稳定 |
+| Directory Header按对齐空隙穿插字段 | 36B Header，删除 `directory_level` 和 `prev_page` | 第一期不是多层目录树；后继链从已发布根正向到达全部页面，减少拆分时要原子更新的链接 |
+| Directory `live_object_count` 使用32 bit、`flags` 使用16 bit | 两者分别缩为16 bit和8 bit | 32KB页面最多约1361个最小目录对象；页级标志只校验模式，未知保留位拒绝解析 |
 | `directory_version` 缩为16 bit | 目录页和邻接数据页都固定使用32 bit | 16 bit回绕会把旧目录页误认为当前目录，造成邻居重复、丢失或写入旧页面 |
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 
