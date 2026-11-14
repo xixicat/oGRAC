@@ -1229,23 +1229,37 @@ page_tail_t
 
 ```c
 typedef struct st_graph_adj_dir_page_header {
-    uint8  adj_dir_format_version;  /* V1=1 */
-    uint8  header_bytes;            /* V1=48 */
-    uint16 object_count;
-    graph_vid_t owner_vid;
-    uint8  direction;
-    uint8  directory_level;
-    uint16 free_begin;
-    uint32 live_object_count;
-    uint32 directory_version;
-    graph_adj_locator_t next_page;
-    graph_adj_locator_t prev_page;
-    uint16 free_end;
-    uint8  itl_count;
-    uint8  itl_capacity;
-    uint16 flags;                    /* PACKED/EXTERNAL/SHARD/MIGRATION */
-    uint16 reserved_zero;
-} graph_adj_dir_page_header_t;       /* 48B */
+    uint8  adj_dir_format_version;  /* offset 0,  V1=1 */
+    uint8  header_bytes;            /* offset 1,  V1=48 */
+    uint8  direction;               /* offset 2 */
+    uint8  directory_level;         /* offset 3 */
+
+    graph_vid_t owner_vid;          /* offset 4 */
+
+    uint16 object_count;            /* offset 12 */
+    uint16 flags;                   /* offset 14, PACKED/EXTERNAL/SHARD/MIGRATION */
+    uint32 live_object_count;       /* offset 16 */
+    uint32 directory_version;       /* offset 20 */
+
+    uint16 free_begin;              /* offset 24 */
+    uint16 free_end;                /* offset 26 */
+    uint8  itl_count;               /* offset 28 */
+    uint8  itl_capacity;            /* offset 29 */
+    uint16 reserved_zero;           /* offset 30 */
+
+    graph_adj_locator_t next_page;  /* offset 32 */
+    graph_adj_locator_t prev_page;  /* offset 40 */
+} graph_adj_dir_page_header_t;      /* 48B */
+```
+
+前2B兼容前缀保持不变。其余字段按“页面身份、对象统计、页内空间、目录页链”分组，所有字段自然满足4B对齐，没有隐式填充。`free_begin/free_end` 与 `itl_count/itl_capacity` 集中描述可变对象区，`next_page/prev_page` 集中描述同一目录链。该格式尚未落盘，因此直接作为V1布局，不为此次重排增加Format Version。
+
+目录页使用与Adjacency Data Page相同的空间规则：
+
+```text
+header_end <= free_begin <= free_end
+free_end <= 固定ITL区域起点
+itl_count <= itl_capacity
 ```
 
 Packed模式在同类Slotted Page中保存小目录及其小邻接列表：
@@ -2277,6 +2291,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许整Extent物理搬迁，并要求Extent Epoch原子递增；Slot generation回绕时退休；
 - Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
 - 0/8/16B 方向属性预算；
+- Adjacency Directory Header按身份、统计、空间和页链分组，48B自然对齐且前2B兼容前缀不变；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
 - Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
 - Directory/Adjacency Side Slot整理不改变object_slot和generation；
@@ -2319,6 +2334,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 一个 Hot Property Bitmap 位 | 每个投影两位的 Inline Property State | 区分 NULL、有效值和 WARNING 回读 |
 | 每个Logical Page维护独立映射Entry | Extent Map主路径 + 现有原位ABR；只允许整Extent重映射 | 普通访问只做Extent翻译，避免为极低概率坏页维护第二套映射、缓存和恢复协议 |
 | Phase 1邻接页持久化Zone Map、Bloom和失效掩码 | 56B Header只保留 `free_begin/free_end`；摘要延后到Format V2 | 8KB页面直接扫描成本较低，避免未经基准验证的摘要维护、删除重建和MVCC复杂度 |
+| Directory Header按对齐空隙穿插字段 | 48B Header按身份、统计、空间和页链分组 | 保持自然4B对齐，同时让相关字段连续、偏移稳定 |
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 
 ## 25. 总体确认清单
