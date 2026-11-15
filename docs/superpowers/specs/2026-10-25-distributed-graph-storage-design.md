@@ -443,7 +443,7 @@ slot_area_offset = align8(上述固定头、ITL和Bitmap区域)
 |---|---:|---:|
 | Vertex Page | 8 | 48B 槽为 164，64B 槽为 123 |
 | Edge Page | 8 | 40B 槽为 196；结果若超过 256 则截断为 256 |
-| Adjacency Directory | 4 | 变长对象，不按固定槽计算 |
+| Adjacency Directory | 独占目录页 4；共页 Packed 页 16 | 变长对象，不按固定槽计算 |
 | Adjacency Data | 16 | 变长对象 |
 | Free Directory | 2 | 索引项或页号栈 |
 | Extent Map、Segment Head | 2 | 无数据槽 |
@@ -507,7 +507,7 @@ Segment Head 字段的用途：
 - `allocated_page_count` 统计已经交给 Extent Map 的逻辑页，`retired_page_count` 统计永久退休、不能重新格式化的逻辑页。
 - `route_epoch` 是该分区 Segment 的路由代次。在线改变 Preferred Instance 时递增，旧请求带着旧代次结束，新请求读取新的 Catalog 路由。
 - `default_slot_size`、`default_slots_per_page` 和 `fixed_itl_capacity` 只用于槽宽固定的 Vertex Segment，并复制到每张 Vertex Page。Edge Segment 的槽宽按页面 Layout 决定，这三个字段写 0。
-- `free_layout_directory` 是 Edge Segment 按 `schema_layout_id` 查找空闲页链的目录根逻辑页号。Vertex、Directory 和 Adjacency Data Segment 写 0。
+- `free_layout_directory` 是空闲页目录索引页的逻辑页号。Edge Segment 用它按 Layout 和空闲槽比例分桶。Adjacency Directory Segment 用它登记仍能放下一个最小共页对象的共享页。Vertex Segment 和 Adjacency Data Segment 写 0。
 - `flags` 在 V1 没有已分配的位，必须写 0；读到非 0 视为损坏。
 
 `graph_mapping_page_ref_t.flags` 和 Extent Map Header 的 `flags` 同样在 V1 必须为 0。引用是否有效由 `ref_epoch`、`page_generation` 和 Entry 的 `PRESENT/RETIRED` 判断。
@@ -794,8 +794,8 @@ Undo 挂在该页 PCR ITL 上，保存被覆盖区域的前镜像，以及 Bitma
 | 06 | `vertex_meta` | 16B | 状态、代次、Label Set、Schema、ITL、邻接模式 |
 | 07 | `inline_properties` | 0B、8B 或 16B | 定长热顶点属性 |
 | 08 | `property_rowid` | 8B | 指向 `24 Vertex Property Row` |
-| 09 | `out_adj` | 12B | 出邻接根位置和总出度 |
-| 10 | `in_adj` | 12B | 入邻接根位置和总入度 |
+| 09 | `out_adj` | 12B | 出邻接根；只有 `DIRECT` 的计数是精确总出度 |
+| 10 | `in_adj` | 12B | 入邻接根；只有 `DIRECT` 的计数是精确总入度 |
 
 三档布局分别为：
 
@@ -878,12 +878,12 @@ Descriptor描述整个方向的邻接集合，不描述单条边，因此不保�
 |---|---|
 | `NO_ADJACENCY` | 无效Locator |
 | `DIRECT` | 单一Edge Type的第一张Adjacency Data Page |
-| `PACKED_DIRECTORY` | Packed Directory对象 |
+| `PACKED_DIRECTORY` | 共页上的本顶点 Packed 对象 |
 | `EXTERNAL_DIRECTORY` | External Directory Root对象 |
 | `SUPERNODE_SHARDED` | Shard Directory对象 |
 | `MIGRATING` | 包含old/new root和switch SCN的Migration对象 |
 
-`edge_count_hint` 在 `DIRECT/PACKED` 下是精确值；在 `EXTERNAL/SUPERNODE/MIGRATING` 下是优化器统计提示，`UINT32_MAX` 表示饱和。执行器只能用它估算成本，不能用提示值0直接判定没有边；精确64-bit计数保存在Directory Entry或Shard Directory中。
+`edge_count_hint` 只在 `DIRECT` 下是精确值。`PACKED_DIRECTORY` 的精确值是共页对象里的 `total_edge_count`，普通插入不回写顶点槽。`EXTERNAL/SUPERNODE/MIGRATING` 下它是优化器统计提示，`UINT32_MAX` 表示饱和。执行器只能用提示估算成本，不能用提示值 0 判定没有边。`EXTERNAL` 的精确 64-bit 计数在 Directory Entry，分片的精确计数在 Shard Entry。
 
 三个Vertex Slot档位具有明确物理偏移：
 
@@ -1010,7 +1010,7 @@ page_id      = graph_page_resolve(VERTEX, logical_page)
 
 ### 8.3 可选 Inline Edge
 
-图级固定 Vertex Slot 后，不能再按 Vertex Type 追加不同大小的 `11 Optional Inline Edge Area`，否则同一图的槽宽将不再固定。因此第一期不在 Vertex Slot 中启用 Inline Edge，编号 `11`–`13` 只作为未来格式扩展点；低度边使用 Packed Small Adjacency Page。
+图级固定 Vertex Slot 后，不能再按 Vertex Type 追加不同大小的 `11 Optional Inline Edge Area`，否则同一图的槽宽将不再固定。因此第一期不在 Vertex Slot 中启用 Inline Edge，编号 `11`–`13` 只作为未来格式扩展点；低度边放在多个顶点共用的 Packed 页上。
 
 如果后续基准测试证明 Inline Edge 的收益足够大，只能在创建图时增加统一的 `VERTEX_INLINE_ADJACENCY_SIZE`，把固定的 OUT/IN 数组计入该图所有 Vertex Slot，而不能按 Vertex Type 改变槽宽。预留的元素格式为：
 
@@ -1177,7 +1177,15 @@ typedef struct st_graph_edge_page_header {
 } graph_edge_page_header_t;         /* 32B */
 ```
 
-Vertex Page Header 和 Edge Page Header 的 `flags` 在 V1 都没有已分配的位，必须写 0。页面状态由 Bitmap、`used_slots`、`free_hint` 和 Slot Meta 表达。
+Vertex Page Header 的 `flags` 在 V1 必须为 0。Edge Page Header 的 `flags` 只使用低 2 位，其余位必须为 0：
+
+```text
+bit 0  IN_FREE_DIRECTORY  页在某个空闲桶中
+bit 1  CHECKED_OUT        已被一个事务弹出，尚未归还
+bit 2–15 保留
+```
+
+`IN_FREE_DIRECTORY` 与 `CHECKED_OUT` 不能同时为 1。两位都为 0 表示这页没有可分配槽，也不在目录中。页面的槽状态仍由 Bitmap、`used_slots`、`free_hint` 和 Slot Meta 表达。
 
 EID的8-bit `slot_id` 允许0–255，页面格式化时必须验证 `slots_per_page <= 256`。Allocation Bitmap是Slot复用和恢复扫描的物理分配依据；边的查询可见性仍由Meta、ITL和Undo决定。
 
@@ -1208,7 +1216,7 @@ Edge Slot也使用 `bitmap[slot_id >> 3]` 和 `1U << (slot_id & 7)` 的LSB-first
 
 Edge Page读取和恢复必须执行与Vertex Page相同的精确Offset、长度、尾部bit、`used_slots/free_hint`和RETIRED校验，并额外验证 `slots_per_page <= 256`。Edge Slot初始化、Bitmap置位、计数和Hint更新也必须属于同一Page Latch和Redo原子单元。
 
-每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout维护空闲页列表。EID中的 `logical_page_no` 通过Extent Map计算物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
+每个 Virtual Partition 使用一个逻辑 Edge Segment，内部页面可以属于不同 Edge Type 和Layout。Segment按Layout和剩余空槽比例登记仍有空槽的页。EID中的 `logical_page_no` 通过Extent Map计算物理 `page_id`，再使用页面头中的固定 `slot_size` 计算：
 
 ```text
 slot_address = slot_area + slot_id * slot_size
@@ -1218,7 +1226,7 @@ slot_address = slot_area + slot_id * slot_size
 
 ### 9.1 空闲边页目录
 
-`free_layout_directory` 是 Edge Segment 中第一张 `PAGE_TYPE_GRAPH_FREE_DIR` 索引页的逻辑页号。Vertex、Directory 和 Adjacency Data Segment 没有这类页面，字段写 0。空闲页号不写进 Edge Page Header，避免为了空闲链改变 32B 边页头。
+`free_layout_directory` 是第一张 `PAGE_TYPE_GRAPH_FREE_DIR` 索引页的逻辑页号。Edge Segment 和 Adjacency Directory Segment 使用它。Vertex Segment 和 Adjacency Data Segment 写 0。空闲页号不写进 Edge Page Header，避免为了空闲链改变 32B 边页头。
 
 目录有两种角色，页头相同：
 
@@ -1237,23 +1245,49 @@ typedef struct st_graph_free_dir_header {
     uint32 next_logical_page_no;    /* UINT32_MAX 表示链尾 */
     uint8  itl_count;
     uint8  itl_capacity;            /* 默认 2 */
-    uint16 reserved_zero;
+    uint8  bucket_id;               /* STACK 页为 0–3；INDEX 页写 0 */
+    uint8  reserved_zero;
     uint32 reserved_zero2;
 } graph_free_dir_header_t;          /* 32B */
 ```
 
-索引页的项指向某个 Layout 的页号栈：
+索引页为每个 `(schema_layout_id, slot_size, bucket_id)` 保存一项：
 
 ```c
 typedef struct st_graph_free_dir_index_entry {
     uint16 schema_layout_id;
     uint16 slot_size;
-    uint32 free_count;
-    uint32 head_logical_page_no;
-} graph_free_dir_index_entry_t;     /* 12B */
+    uint8  bucket_id;               /* 0–3 */
+    uint8  flags;                   /* V1=0 */
+    uint16 reserved_zero;
+    uint32 page_count;              /* 本桶页数，每页最多一项 */
+    uint32 head_logical_page_no;    /* UINT32_MAX 表示空桶 */
+} graph_free_dir_index_entry_t;     /* 16B */
 ```
 
-栈页的负载是 `uint32 logical_page_no[entry_capacity]`，只保存同一个 `schema_layout_id` 和 `slot_size`。`entry_count` 是栈顶。分配从栈顶弹出，释放压回栈顶；栈页满了就再分配一张栈页并更新索引项的 `head_logical_page_no`。弹出和压入与使用该边页的数据修改属于同一事务，Undo 按相反方向恢复栈顶。`entry_capacity` 在格式化时固定，数组不向 ITL 区域生长。
+栈页的负载是 `uint32 logical_page_no[entry_capacity]`。一条链只保存同一个 Layout、槽宽和桶。`entry_count` 是栈顶。栈页满了就再分配一张栈页并更新对应索引项的 `head_logical_page_no`。`entry_capacity` 在格式化时固定，数组不向 ITL 区域生长。同一个逻辑页号在全部桶中最多出现一次。
+
+边页按可分配槽占 `slots_per_page` 的比例分四桶。可分配槽是位图中为 0 的槽，退休槽保持为 1，不计入。分配从桶 3 向桶 0 查找第一条非空链：
+
+```text
+allocatable = slots_per_page - used_slots
+allocatable == 0                         不进入目录
+allocatable * 4 <= slots_per_page        桶 3，最满
+allocatable * 2 <= slots_per_page        桶 2
+allocatable * 4 <= slots_per_page * 3    桶 1
+其余                                     桶 0，最空
+```
+
+弹出的是桶的栈顶，因此并发事务拿到不同的边页。归还时压回目标桶的栈顶，单写时会继续填满同一页。页被弹出后不留在错误的桶里；下一次从该桶取到它时，按当时的位图放回正确的桶。不在栈中间删除页号。
+
+分配和归还与使用该槽的数据修改属于同一事务：
+
+1. 只持有空闲目录页，从最满的非空桶弹出一页，把边页标志从 `IN_FREE_DIRECTORY` 改成 `CHECKED_OUT`，写 `RD_GRAPH_FREE_POP`。然后释放目录页。
+2. 按第 16.5 节的 `page_id` 顺序获取边页和其他数据页，在边页上分配槽。
+3. 释放数据页后，再按 `page_id` 顺序同时持有目录页和该边页，重读位图。仍有可分配槽就把页压入对应桶并改回 `IN_FREE_DIRECTORY`；没有可分配槽就清除两位标志。写 `RD_GRAPH_FREE_PUSH`。
+4. 安全回收使一页重新出现可分配槽时，只有标志两位都是 0 才压入目录。`CHECKED_OUT` 的页由弹出它的事务归还，回收事务不再压入。两位同时为 1 视为损坏。
+
+Undo 按相反方向恢复栈顶和这两位标志。归还前先释放已经持有的数据页，再只把空闲目录页和这一张边页按 `page_id` 顺序重新取齐，避免一边持有顶点页或邻接页、一边等待目录页。Adjacency Directory Segment 复用同一页格式，但只有 `schema_layout_id=0`、`slot_size=0`、桶 0 这一条链，链上是仍能放下一个最小共页对象的共享目录页。边段的 `schema_layout_id` 从 1 起编，不会占用这条键。
 
 规范边是属性事实来源。出邻接和入邻接中的属性是为遍历准备的副本。
 
@@ -1298,13 +1332,13 @@ Edge Type 数量随顶点变化。把完整目录放进固定槽会浪费低度�
 
 ### 10.3 四种物理形态
 
-目录是逻辑对象。`DIRECT` 不分配Directory Page；进入 `PACKED/EXTERNAL/SHARDED` 后，Directory Page由一个 `owner_vid + direction` 独占，但同页保存该方向的多个Edge Type，不为每个Edge Type单独分配页面：
+目录是逻辑对象。低度顶点不独占邻接页。一个方向上的低度边放进共页 Packed 对象，多个顶点的对象共用同一张目录页。对象变大后，这个顶点才获得自己的独占目录页和邻接数据页。
 
 | 模式 | 场景 | 物理形式 |
 |---|---|---|
-| `DIRECT` | 单一 Edge Type | 描述符直接指向邻接页 |
-| `PACKED_DIRECTORY` | 少量 Edge Type | 小目录和邻接项共享页面 |
-| `EXTERNAL_DIRECTORY` | 多 Edge Type | 独立目录页 |
+| `DIRECT` | 单一 Edge Type 的独占邻接数据页 | 描述符直接指向邻接数据页。自动切换不进入此模式 |
+| `PACKED_DIRECTORY` | 低度，一种或多种边 | 描述符指向共页上的本顶点对象 |
+| `EXTERNAL_DIRECTORY` | 对象超过共页预算 | 本顶点独占的目录页 |
 | `SUPERNODE_SHARDED` | 超高度数 | 目录指向分片目录 |
 
 外部目录项为 32B：
@@ -1333,7 +1367,17 @@ typedef struct st_graph_adj_dir_entry {
 3–255 非法
 ```
 
-`shard_policy` 的编号是：`0 HASH_NEIGHBOR`、`1 RANGE_NEIGHBOR`、`2 RANGE_TIME`、`3 EDGE_SUBTYPE`、`4 EDGE_TYPE_HASH`。未分片时写 0，同时 `shard_count=1`。`sort_key_id` 是 Schema Layout 中排序键的稳定序号，0 表示该 Edge Type 不要求邻接项有序；升降序由 DDL 的 `SORT BY` 记入 Schema，不占用这个字节。`flags` 在 V1 必须为 0，项的分配和删除状态放在 Side Slot 中。
+`shard_policy` 的编号是：`0 HASH_NEIGHBOR`、`1 RANGE_NEIGHBOR`、`2 RANGE_TIME`、`3 EDGE_SUBTYPE`、`4 EDGE_TYPE_HASH`。未分片时写 0，同时 `shard_count=1`。`sort_key_id` 与 Catalog 的 `sort_ordinal` 使用同一字节，升降序仍由 `sort_desc` 单独表示：
+
+```text
+0x00              不排序
+bit 7 = 1         有排序键
+bits 0–2          投影 ordinal 0–7
+bits 3–6          必须为 0
+其他组合          损坏
+```
+
+投影序号仍从 0 开始。`CLICKED` 的 OUT/IN 按 `timestamp` 降序时，`timestamp` 是序号 0，因此这个字节是 `0x80`，`sort_desc=1`。字节 0 只表示不排序，不能再表示“按第 0 号投影排序”。`flags` 在 V1 必须为 0，项的分配和删除状态放在 Side Slot 中。
 
 Directory和Adjacency Data都采用带generation和ITL的8B Side Slot：
 
@@ -1402,10 +1446,15 @@ bit 0  PACKED
 bit 1  EXTERNAL
 bit 2  SHARDED
 bit 3  MIGRATING
-bit 4–7 reserved，V1必须为0
+bit 4  SHARED
+bit 5  IN_FREE_DIRECTORY  仅 SHARED 页：仍能放下一个最小对象，且在空闲链中
+bit 6  CHECKED_OUT        仅 SHARED 页：已被弹出，尚未归还
+bit 7  reserved，必须为 0
 ```
 
-`PACKED`、`EXTERNAL`、`SHARDED` 互斥，`MIGRATING` 可以与其中一位同时置位。页级标志只交叉校验顶点描述符中的方向模式，边和目录项本身仍在对象与Side Slot中。V1读到保留位为1时把页面视为损坏，不能忽略后继续解析。
+`PACKED`、`EXTERNAL`、`SHARDED` 互斥。`SHARED` 必须和 `PACKED` 同时置位，并且不能和 `EXTERNAL` 或 `SHARDED` 同时置位。`MIGRATING` 可以与其中一种页面角色同时置位。`SHARED` 页的 `owner_vid` 必须为 0，`direction` 仍是 OUT 或 IN，不同方向不混在一页。页上每个对象保存自己的 `owner_vid`。没有 `SHARED` 的页由页头 `owner_vid` 表示唯一主人，bit 5 和 bit 6 必须为 0。这两位不能同时为 1。弹出、归还和“重新出现空闲”的规则与第 9.1 节的边页相同，只是归还条件换成“仍能放下一个最小共页对象”。邻接目录段只使用桶 0，不按空闲比例再分档。V1 读到 bit 7 为 1 时把页面视为损坏。
+
+共页的 `directory_version` 固定为 0。它不是某个顶点的目录发布号，读取时不和顶点目录版本比较。独占目录页和挂在其上的邻接数据页仍使用第 10.3 节的 32-bit 发布号。`DIRECT` 没有目录页，其邻接数据页的 `directory_version` 也写 0。
 
 目录页使用与Adjacency Data Page相同的空间规则：
 
@@ -1415,11 +1464,18 @@ free_end <= 固定ITL区域起点
 itl_count <= itl_capacity
 ```
 
-`directory_version` 固定为 32 bit。它是该顶点单个方向的目录结构发布号，目录链页面和 Adjacency Data Page 在挂接时复制它，读取时必须等于当前已发布的目录版本。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
+`directory_version` 固定为 32 bit。它是该顶点单个方向的独占目录发布号。独占目录链和挂到这条链上的 Adjacency Data Page 在挂接时复制它，读取时必须等于当前已发布的目录版本。共页和 `DIRECT` 页面写 0，不参加这个比较。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
 
-Packed模式在同类Slotted Page中保存小目录及其小邻接列表：
+共页上的一个对象只属于一个顶点的一个方向。顶点描述符指向它的 Side Slot。对象以主人头开始，后面是一种或多种边的小列表：
 
 ```c
+typedef struct st_graph_shared_owner_header {
+    graph_vid_t owner_vid;
+    uint16 list_count;
+    uint16 flags;                   /* V1=0 */
+    uint32 total_edge_count;        /* 各列表 entry_count 之和 */
+} graph_shared_owner_header_t;      /* 16B */
+
 typedef struct st_graph_packed_adj_list_header {
     uint32 edge_type_id;
     uint16 schema_layout_id;
@@ -1429,11 +1485,13 @@ typedef struct st_graph_packed_adj_list_header {
 } graph_packed_adj_list_header_t;    /* 16B，随后是Adjacency Entry数组 */
 ```
 
-`entry_count` 是这个小列表中的邻接项数量。`flags` 在 V1 必须为 0，列表的删除和版本由它所在的 Side Slot 与 ITL 表达。
+`total_edge_count` 必须等于各可见列表的 `entry_count` 之和；不一致时以列表为准继续扫描。`entry_count` 是这个小列表中的邻接项数量。两个 `flags` 在 V1 都必须为 0。列表的删除和版本由对象所在的 Side Slot 与 ITL 表达。增删一条边时复制并版本化整个对象，不给共页对象内部的每条 Entry 分配独立 Side Slot。
 
-Packed Directory Entry的 `root_locator` 指向该对象。对象可以与目录在同页；空间不足或数量超过阈值时，创建External Directory和Adjacency Data Page，再以MVCC版本化方式切换Vertex Descriptor Root。
+8KB 共页使用 16 个 ITL。页头、身份、36B 目录头、ITL 和页尾约占 484B。一条没有方向属性的边约占 56B：16B 主人头、16B 列表头、16B 邻接项和 8B Side Slot。一页大约容纳 130 个这样的一度顶点。百亿个一度顶点在一个方向上大约是 630GB，而不是每顶点独占一页的约 80TB。没有边的顶点不占用邻接页。
 
-Packed List是低度场景的单个MVCC对象：对应的 `graph_adj_object_slot_t.itl_id` 管理整个List，增删边时复制并版本化完整小List，不给内部每条Entry分配独立Side Slot。达到大小或更新频率阈值后必须晋升External模式；External Adjacency Data Page中的每条Entry才使用独立 `graph_adj_slot_t` 和ITL。
+新对象从该方向的共享页链弹出一页。插入后若页面仍能放下另一个最小对象，就把页压回链头；放不下就留在链外，已有对象保持原 Locator。并发事务弹出不同的页。最小对象是一条列表加一条邻接项，负载 48B，再加一个 8B Side Slot。对象不因为其他顶点的插入而搬迁。
+
+独占目录页上的小列表可以继续使用 `graph_packed_adj_list_header_t`，但整页只有一个 `owner_vid`，不再加共页主人头。超过预算的边进入 Adjacency Data Page，那里的每条 Entry 使用独立 `graph_adj_slot_t` 和 ITL。
 
 超级节点的Directory Entry指向Shard Entry数组：
 
@@ -1473,13 +1531,15 @@ typedef struct st_graph_adj_migration {
 
 | 当前形态 | 触发条件 | 新形态 |
 |---|---|---|
-| `NO_ADJACENCY` | 该方向第一条边 | `DIRECT` |
-| `DIRECT` | 同一方向出现第二种 Edge Type | `PACKED_DIRECTORY` |
-| `PACKED_DIRECTORY` | 某个 Packed 对象编码超过 2048B，或其中一类 `entry_count` 超过 32，或下一次写入放不进当前页 | `EXTERNAL_DIRECTORY` |
+| `NO_ADJACENCY` | 该方向第一条边 | `PACKED_DIRECTORY`，对象放在共页 |
+| `PACKED_DIRECTORY` | 对象编码将超过 2048B，或其中一类 `entry_count` 将超过 32，或共页无法原地容纳下一次写入 | `EXTERNAL_DIRECTORY` |
+| `DIRECT` | 同一方向出现第二种 Edge Type | `EXTERNAL_DIRECTORY` |
 | `DIRECT` | 这唯一的 Edge Type 度数达到 `PROMOTE_AT_DEGREE`，默认 100000 | `SUPERNODE_SHARDED` |
-| `EXTERNAL_DIRECTORY` | 其中某一个 Edge Type 达到 `PROMOTE_AT_DEGREE` | Mode 保持 `EXTERNAL_DIRECTORY`，只把该类型的 Directory Entry 指向 Shard 数组 |
+| `EXTERNAL_DIRECTORY` | 其中某一个 Edge Type 达到 `PROMOTE_AT_DEGREE` | 该类型只有一种边时改为 `SUPERNODE_SHARDED`；否则 Mode 保持 `EXTERNAL_DIRECTORY`，只把该类型的 Directory Entry 指向 Shard 数组 |
 
-`DIRECT` 的 Root 指向这一种 Edge Type 的第一张邻接数据页，`edge_count_hint` 是精确值。第二种 Edge Type 不能继续挂在这个 Root 上，否则查询一种边会扫到另一种边。Packed 对象每次修改都复制整份小列表，所以超过 2048B 或 32 条就拆成每种边一条外部页链。只有一种边且度数达到阈值时，顶点 Mode 改为 `SUPERNODE_SHARDED`。多种边里只有一种达到阈值时，不把其他边一并分片。
+第一条边不进入 `DIRECT`，因此不为一度顶点分配独占邻接页。`DIRECT` 仍然表示描述符直接指向单一 Edge Type 的邻接数据页，精确计数放在顶点 `edge_count_hint`；自动切换不产生这种形态，避免后续插入为了维护精确计数而串行在顶点页上。`EXTERNAL` 即使只有一种边，也用 Directory Entry 的 64-bit `edge_count` 保存精确计数。
+
+共页对象每次修改都复制整份对象。超过 2048B 或 32 条的那一类改挂到独占邻接数据页；仍低于阈值的其他类可以留在独占目录页的 Packed 列表中。只有一种边且度数达到阈值时，顶点 Mode 改为 `SUPERNODE_SHARDED`。多种边里只有一种达到阈值时，不把其他边一并分片。
 
 默认分片是 `HASH(neighbor_vid)`，`MIN_SHARDS=16`，每片目标 65536 条，`MAX_SHARDS=256`。第一期不因为删除而自动退回更低形态，避免度数在阈值附近来回切换。切换一律先写 Migration 对象和 `switch_scn`，再原子发布新的 Mode 与 Root。
 
@@ -1532,7 +1592,7 @@ typedef struct st_graph_adj_slot {
 } graph_adj_slot_t;                  /* 8B */
 ```
 
-它保存项偏移、长度、代次、PCR ITL和删除标志。`entry_length` 必须等于页面声明的 `16 + direction_inline_size`。邻接页只包含一个 `owner_vid + direction + edge_type`，因此项内不重复保存这些字段。
+它保存项偏移、长度、代次、PCR ITL和删除标志。`entry_length` 必须等于页面声明的 `16 + direction_inline_size`。独占邻接数据页只包含一个 `owner_vid + direction + edge_type`，因此项内不重复保存这些字段。共页对象不使用这种页面。
 
 OUT和IN的Entry结构相同，但 `neighbor_vid` 语义不同：
 
@@ -1777,14 +1837,14 @@ Inline Edge 能让低度拓扑查询在读到 `05` 后直接获得 `12 neighbor_
 Vertex Inline Size = 0B
 Vertex Slot = 48B
 Inline Edge Capacity = 0
-低度邻接 = Packed Small Adjacency Page
-普通邻接 = 带 OUT/IN Inline Properties 的邻接页
+低度邻接 = 多个顶点共用的 Packed 页
+普通邻接 = 独占目录页和带 OUT/IN Inline Properties 的邻接页
 超级节点 = 分片邻接段
 ```
 
-第一期包括 `BELONGS_TO`、`CREATED_BY` 在内的低度边也使用 Packed Small Adjacency Page。热点顶点提前进入普通邻接页，避免所有写操作争抢顶点页 X Owner。
+第一期包括 `BELONGS_TO`、`CREATED_BY` 和低度 `CLICKED` 在内的边，都先进入共页 Packed 对象。对象超过 2048B 或 32 条后，该顶点才进入独占邻接页。热点顶点因此不会在第一条边时占用整页，后续插入也不为了维护顶点槽计数而争抢顶点页 X Owner。
 
-未来若启用 Inline Edge，它没有独立 ITL，其变化记录在顶点槽版本和Undo中；同一顶点槽上的内嵌边更新会串行化。这也是第一期选择Packed Small Adjacency Page的原因之一。
+未来若启用 Inline Edge，它没有独立 ITL，其变化记录在顶点槽版本和Undo中；同一顶点槽上的内嵌边更新会串行化。第一期因此把低度边放在共页对象中，而不是放进顶点槽。
 
 ## 13. 属性页
 
@@ -1929,7 +1989,9 @@ DIRECT
 
 PACKED_DIRECTORY
  → Root按GRAPH_SEG_ADJ_DIRECTORY解析
- → 在Packed Directory查找CLICKED对象
+ → 页标志含 SHARED，页头 owner_vid 为 0
+ → 对象主人头的 owner_vid 等于当前顶点
+ → 在该对象的列表中查找CLICKED
 
 EXTERNAL_DIRECTORY
  → 读取Directory Root
@@ -1949,12 +2011,14 @@ MIGRATING
 
 ```text
 page_type和graph_page_identity
-owner_vid == 当前顶点VID
 direction == OUT
 edge_type_id == CLICKED
 schema_layout_id可读
-directory_version等于当前已发布目录版本
 root locator generation匹配
+SHARED 页：页头 owner_vid 为 0，对象主人等于当前顶点，directory_version 为 0
+独占页：页头 owner_vid 等于当前顶点
+独占目录链上的页：directory_version 等于当前已发布目录版本
+DIRECT 或共页：directory_version 为 0，不做目录版本比较
 ```
 
 扫描Entry时：
@@ -2020,12 +2084,12 @@ candidate VID → 26/05 → 07 热属性 → 必要时 08/24
 加锁只覆盖这次真正修改的页，并且遵守固定顺序：
 
 1. Segment Head 和 Extent Map 只在分配或格式化逻辑页时持有。持有它们时不得等待数据页 Latch。中途发现需要新页，就释放已经持有的数据页 Latch，完成分配和格式化，再重新按顺序获取。
-2. 顶点页、规范边页、邻接页、目录页和空闲目录页按物理 `page_id`（file，page）升序获取 X Latch。远程页的 DRC X Owner 也按这个顺序申请，后一页必须等前一页授予之后再申请。A→B 与 B→A 因此不会交叉等待。同一页内按 `slot_id` 或 `object_slot` 升序修改。
+2. 顶点页、规范边页、邻接页和目录页按物理 `page_id`（file，page）升序获取 X Latch。远程页的 DRC X Owner 也按这个顺序申请，后一页必须等前一页授予之后再申请。A→B 与 B→A 因此不会交叉等待。同一页内按 `slot_id` 或 `object_slot` 升序修改。空闲目录页不放进这组锁里；它的弹出和归还按第 9.1 节单独进行，归还时只和被弹出的那一张页按 `page_id` 排序。
 3. 属性堆表和 PCR B-tree 使用它们原有的加锁顺序。先插入属性行并释放堆页和索引页，得到 `rowid_t`，再执行第 2 步把 RowID 写入图槽。图页 Latch 不和堆页、索引页交叉持有。
-4. `DIRECT` 和 `PACKED` 的 `edge_count_hint` 是精确值，源顶点页和目标顶点页都加入第 2 步。`EXTERNAL` 和 `SUPERNODE_SHARDED` 的 hint 不是精确值，热路径不修改对端顶点槽，避免所有入边串行在超级节点的顶点页上；64-bit 精确计数写在 Directory Entry 或 Shard Entry 中。
+4. 第一次发布或改变某个方向的 Mode 和 Locator 时，该顶点页加入第 2 步。此后的共页插入只修改共页对象、规范边槽和空闲目录，不回写两端顶点槽。`DIRECT` 的精确计数在顶点槽，因此插入要锁住该方向的主人顶点页。`EXTERNAL` 和 `SUPERNODE_SHARDED` 的热路径不修改顶点槽；64-bit 精确计数写在 Directory Entry 或 Shard Entry 中。
 5. 分裂导致页集合变化时，释放全部数据页 Latch，把新页加入集合后重试。重试继续使用已经分配的 EID，不能再分配一条边。
 
-第一次创建邻接或发生 `DIRECT→PACKED→EXTERNAL→SHARDED` 转换时，先完整构造新Root，再在Vertex Slot的PCR ITL保护下原子更新对应方向的Mode Nibble和Descriptor Root。旧查询通过CR Vertex Slot读取旧Root；只有旧快照结束后才回收旧对象。Mode和Root不能分两次无版本写入。
+第一次创建邻接或发生 `PACKED→EXTERNAL→SHARDED` 转换时，先完整构造新Root，再在Vertex Slot的PCR ITL保护下原子更新对应方向的Mode Nibble和Descriptor Root。`DIRECT` 若已经存在，离开它时同样先写 Migration 对象。旧查询通过CR Vertex Slot读取旧Root；只有旧快照结束后才回收旧对象。Mode和Root不能分两次无版本写入。
 
 ### 16.6 删除边和顶点
 
@@ -2111,7 +2175,7 @@ PARTITION BY HASH (tenant_id, external_id);
 
 DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。顶点类型名同时注册为 Label。广告图示例将 `User` 标为 `COMMON` 并取得序号 0，后续 Tag 再依次取得序号。
 
-第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边由Packed Small Adjacency Page承载。
+第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边放在多个顶点共用的 Packed 页上。
 
 ### 17.3 Tag
 
@@ -2205,7 +2269,7 @@ STORAGE (
 );
 ```
 
-第一期 DDL 不接受 `ZONEMAP`。邻接页不保存 Zone Map，排序只决定 `sort_key_id` 和写入顺序。`detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
+第一期 DDL 不接受 `ZONEMAP`。邻接页不保存 Zone Map，排序只决定 `sort_key_id` 和写入顺序。例子里的 `timestamp` 是 OUT/IN 的第 0 号投影，降序写入 `sort_ordinal=0x80` 和 `sort_desc=1`。`detail` 未列入 Inline 子句，进入 `25`。例子中的EDGE INLINE编码值为16B，因此AUTO选择56B Canonical Edge Slot。显式配置支持 `COMPACT`、`INLINE_8`、`INLINE_16` 和 `INLINE_24`；编码宽度分别校验：EDGE INLINE不超过所选预算且投影不超过8个；OUT与IN各自不超过所选的8B或16B，其中2B `inline_property_state_bitmap` 计入方向预算。
 
 例子中的 OUT/IN `timestamp` 使用 `WARNING`，因此完整时间戳必须保留在规范 Edge Slot 或 `25`。超出2026 Base的 `INLINE_TIME32` 秒范围时，边写入仍成功，但邻接项对应状态设置为`10`，查询批量回读规范时间戳。默认策略仍是 `REJECT`。
 
@@ -2256,8 +2320,8 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `graph_id` | `UINT32` | 主键 |
 | `name` | `VARCHAR(128)` | 库内唯一 |
 | `default_consistency` | `UINT8` | 1 `STATEMENT`，2 `TRANSACTION`，3 `EVENTUAL` |
-| `virtual_partition_count` | `UINT16` | 2 的幂，最大 65536 |
-| `placement_partition_count` | `UINT16` | 2 的幂，且能整除上一列 |
+| `virtual_partition_count` | `UINT32` | 2 的幂，最大 65536 |
+| `placement_partition_count` | `UINT32` | 2 的幂，且能整除上一列，最大 65536 |
 | `vertex_inline_size` | `UINT16` | 0、8 或 16 |
 | `vertex_slot_size` | `UINT16` | 48、56 或 64 |
 | `eid_layout` | `UINT8` | 1 表示 `VP16_PAGE24_SLOT8_GEN16` |
@@ -2267,6 +2331,8 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `tablespace_id` | `UINT32` | 图 Segment 和属性表所在表空间 |
 | `status` | `UINT8` | 1 `ONLINE`，2 `MIGRATING`，3 `DROPPED` |
 | `created_scn` | `UINT64` | 创建 SCN |
+
+两个个数列使用 `UINT32`，是因为 65536 存不进 `UINT16`。VID、EID、页身份、Segment Head 和 Placement 区间里的分区号仍是 16 bit。65536 个分区时末尾编号是 65535，`vp_start`、`vp_end` 和 `placement_id` 保持 `UINT16`。个数超过 65536 才会加宽这些标识字段。
 
 `SYS_GRAPH_PLACEMENT` 的主键是 `(graph_id, vp_start)`：
 
@@ -2319,7 +2385,7 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `slot_profile` | `UINT8` | 0 `AUTO`，1 `COMPACT`，2 `INLINE_8`，3 `INLINE_16`，4 `INLINE_24` |
 | `current_schema_layout_id` | `UINT16` | 新边使用的布局 |
 | `property_table_id` | `UINT32` | 冷边属性堆表 |
-| `sort_ordinal` | `UINT8` | 0 表示不排序；否则是 Inline 投影序号 |
+| `sort_ordinal` | `UINT8` | `0x00` 不排序；bit 7 为 1 时低 3 位是投影序号 0–7 |
 | `sort_desc` | `UINT8` | 0 升序，1 降序 |
 | `promote_at_degree` | `UINT32` | 默认 100000 |
 | `shard_policy` | `UINT8` | 第 10.3 节的 0–4 |
@@ -2357,7 +2423,7 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `inline_value_bytes` | `UINT16` | 紧凑编码后的字节数 |
 | `slot_size` | `UINT16` | 边布局为 40/48/56/64；顶点布局写图级槽宽 |
 | `hash_algo_version` | `UINT16` | 1 表示 `cm_hash_raw` |
-| `sort_ordinal`、`sort_desc` | `UINT8` | 从边类型复制的排序键 |
+| `sort_ordinal`、`sort_desc` | `UINT8` | 从边类型复制；`sort_ordinal` 的 bit 7 表示有排序键 |
 | `status` | `UINT8` | 1 `ACTIVE`，2 `HISTORICAL` |
 
 `SYS_GRAPH_INLINE_PROJ` 的主键是 `(graph_id, schema_layout_id, direction, ordinal)`：
@@ -2651,7 +2717,11 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 40/48/56/64B Edge Page的页内固定槽定位；
 - Edge Page Header与Graph、Page Type、Edge Type、Schema Layout、Edge Format Version和Slot宽度交叉校验；
 - Edge逻辑页清空后不允许更换逻辑身份或Layout；保持Slot内容、Page Generation和Layout时允许整Extent物理搬迁，并要求Extent Epoch原子递增；Slot generation回绕时退休；
-- Inline Edge字段保持零值，低度边进入Packed Small Adjacency Page；
+- Inline Edge字段保持零值，低度边进入多个顶点共用的 Packed 页；同一页的对象主人各不相同，页头 `owner_vid` 为 0；
+- 共页对象超过 2048B 或单类 32 条后切换到独占目录页，旧快照仍读取旧对象；
+- `sort_ordinal` 和 `sort_key_id` 的 `0x00` 表示不排序，`0x80` 表示按投影 0 排序，`CLICKED` 的 timestamp 降序使用 `0x80`；
+- 边页空闲目录按四档空闲比例分桶，有可分配槽的页要么在唯一一个桶中，要么处于 `CHECKED_OUT`；弹出后仍有空槽必须归还；
+- `virtual_partition_count` 和 `placement_partition_count` 为 `UINT32`，分区号字段保持 16 bit，个数不超过 65536；
 - 0/8/16B 方向属性预算；
 - Adjacency Directory Header为36B，前2B兼容前缀不变，`directory_version` 仍为32 bit；
 - 目录链只有 `next_page`，拆分和合并从已发布根扫描前驱，旧引用退出前不回收页面；
@@ -2689,7 +2759,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 所有Canonical Edge固定64B | Page内固定，按Layout使用40/48/56/64B | 保持直接定位，同时提高无属性边和窄边的页面密度 |
 | 邻接项使用 edge_token | 普通邻接项使用完整 EID | 降低重建和恢复复杂度 |
 | 用户配置 Covering Properties | 用户配置 EDGE/OUT/IN INLINE | 直接表达三个物理副本 |
-| 每个顶点独立 Directory Page | DIRECT、PACKED、EXTERNAL、SHARDED四种形态 | 低度顶点避免额外页面，超级节点可独立分片 |
+| 每个顶点独立 Directory Page | 低度顶点共用 Packed 页；对象变大后才进入独占目录、邻接数据页或分片 | 低度顶点避免每人一页，超级节点仍可独立分片 |
 | 图分区绑定一个 DRC 分区 | 两类分区正交 | DRC Master 可分散，本地性由 Page Owner 保证 |
 | 单 Label | 32 bit `label_set_id` 复用为常用 Label 位图，放不下时使用外部 Label Set | 常见角色组合直接在顶点槽判断，同时支持任意 Label 组合 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
@@ -2707,6 +2777,10 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 | 图单独指定 `PAGE_SIZE`，DDL 声明 `ZONEMAP` | 图使用数据库页大小；第一期邻接页不保存 Zone Map | Buffer、表空间和 Redo 只有一个页大小；页面级摘要已经推迟到 Format V2 |
 | 属性行私有 24B 图身份头 | 普通 PCR 堆表加 `owner_id`、`owner_generation`、`schema_layout_id` 系统列 | 复用行格式、加列、LOB 和迁移链，避免堆扫描把私有头当成用户列 |
+| 低度边的第一条进入独占邻接页 | 多个低度顶点共用 Packed 页，对象头保存 `owner_vid`；超过 2048B 或 32 条后才独占 | 一度顶点不再各占一页；百亿一度顶点从约 80TB 降到约 630GB |
+| 排序字节 0 同时表示不排序和投影 0 | bit 7 表示有排序键，低 3 位是投影序号 0–7 | `CLICKED` 按 timestamp 排序可以落成 `0x80`，又不和“不排序”冲突 |
+| 分区个数使用 `UINT16` | `virtual_partition_count` 和 `placement_partition_count` 使用 `UINT32` | 65536 可以入库；页上的 16 bit 分区号保持不变 |
+| 空闲边页只做一条栈，弹出后可能不再归还 | 按剩余空槽分四桶，弹出的页在仍有空槽时归还到对应桶 | 并发分配拿到不同页，半空页不会从目录中消失 |
 
 ## 25. 总体确认清单
 
@@ -2715,7 +2789,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 1. 原生图页面、复用 oGRAC 事务和 DRC。
 2. VID使用16-bit虚拟分区、32-bit序号和16-bit代次；EID使用16-bit虚拟分区、24-bit逻辑页、8-bit页内槽和16-bit代次。
 3. 图虚拟分区、Placement、Preferred Instance、DRC 分区和 Page Owner 互不替代。
-4. 同一图的Vertex Slot固定；图创建时选择0B、8B或16B Inline预算，默认0B，对应48B、56B或64B Slot；第一期Inline Edge关闭，低度边使用Packed Small Adjacency Page。
+4. 同一图的Vertex Slot固定；图创建时选择0B、8B或16B Inline预算，默认0B，对应48B、56B或64B Slot；第一期Inline Edge关闭，低度边放在多个顶点共用的 Packed 页上。
 5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. OUT/IN各使用相同的12B Descriptor但独立Mode；目录按Edge Type路由，并选择DIRECT、PACKED、EXTERNAL或SHARDED。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。
