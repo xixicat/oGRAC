@@ -333,7 +333,7 @@ Edge Slot删除后再次分配时 generation递增；generation即将回绕时�
 
 使用 ID Namespace 而不是 Label，因为一个顶点的 Label 可以增减，业务身份保持不变。
 
-创建顶点时，ID Map、Vertex Slot 和属性记录在同一事务提交。首次查询通过 ID Map 得到 VID；后续遍历直接使用 VID。
+创建顶点时，ID Map、Vertex Slot 和属性记录在同一事务提交，并使 `label_set_id` 包含类型名，规则见第 15 节。可见顶点的这个字不能是 0。首次查询通过 ID Map 得到 VID；后续遍历直接使用 VID。
 
 ID Map 复用现有 PCR B-tree，不新增页面类型。键是 `(graph_id, id_namespace_id, external_id)`，值是 VID。Label 倒排同样复用 PCR B-tree，键是 `(graph_id, label_id, virtual_partition_id, vid)`。
 
@@ -1439,7 +1439,7 @@ typedef struct st_graph_adj_dir_page_header {
 
 前2B兼容前缀保持不变。`flags` 使用紧随前缀的第3字节，不占用兼容前缀。字段按“页面身份、对象统计、页内空间、后继页”排列，自然满足4B对齐，没有隐式填充。该格式尚未落盘，因此直接作为V1布局。
 
-V1不保存 `directory_level` 和 `prev_page`。第一期目录不是多层树。没有 `SHARED` 的独占目录页，由该顶点这个方向的已发布根沿 `next_page` 到达全部目录页，空 Locator 表示链尾。这与邻接数据页只保留 `next_page` 的规则相同。拆分页或合并页时，从已发布根扫描得到前驱，只修改前驱的 `next_page`，并在 Undo 中记录旧值；不能从链中页反向查找前驱。独占目录页的扫描必须校验页头 `owner_vid`、`direction`、`directory_version` 和 Page Generation，并拒绝回环。
+V1不保存 `directory_level` 和 `prev_page`。第一期目录不是多层树。没有 `SHARED` 的独占目录页，由该顶点这个方向的已发布根沿 `next_page` 到达全部目录页，空 Locator 表示链尾。这与邻接数据页只保留 `next_page` 的规则相同。拆分页或合并页时，从已发布根扫描得到前驱，只修改前驱的 `next_page`，并在 Undo 中记录旧值；不能从链中页反向查找前驱。独占目录页的扫描必须校验页头 `owner_vid`、`direction` 和 Page Generation，并拒绝回环。`directory_version` 与本次选中的根比较，规则见本节后文。
 
 `SHARED` 页的 `next_page` 固定为空 Locator，不参与任何顶点的目录链。空闲共享页只出现在第 9.1 节的字节桶中。读取一个共页对象时只使用顶点 Locator 里的 `object_slot`，并校验页标志含 `SHARED`、页头 `owner_vid` 为 0、`directory_version` 为 0、对象主人等于当前顶点。所有仍被旧快照、缓存、Buffer Pin 或 DRC 引用的页面，在引用退出前不得回收。
 
@@ -1470,7 +1470,9 @@ free_end <= 固定ITL区域起点
 itl_count <= itl_capacity
 ```
 
-`directory_version` 固定为 32 bit。它是该顶点单个方向的独占目录发布号。独占目录链和挂到这条链上的 Adjacency Data Page 在挂接时复制它，读取时必须等于当前已发布的目录版本。共页和 `DIRECT` 页面写 0，不参加这个比较。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
+`directory_version` 固定为 32 bit。它标识一条独占目录链，不表示“当前最新版本”。链的第一页在格式化时写下这个版本，挂到这条链上的后续目录页和 Adjacency Data Page 原样复制它。原地修改已发布链时不改这个号。只有发布另一条新链时，新链使用新的 `directory_version`，旧链保持原值，不能把旧页改写成新版本。
+
+读取时先按第 10.3 节的 Migration 规则选定一个根。期望版本取这个根页面上的 `directory_version`，沿途页面必须等于它。早于 `switch_scn` 的查询选中旧根，就只接受旧版本；新链已经发布也不改变这个比较。拿旧页去比目录上最新的版本，会把仍应可见的邻居判成损坏。共页和 `DIRECT` 页面写 0，不参加这个比较。它不代替 Locator `generation`、查询 SCN 或 `mapping_epoch`。不采用 16 bit：版本回绕后，旧目录页可能再次通过版本比较，造成邻居重复或丢失；写入旧页面还会破坏该方向的邻接结构。版本耗尽前必须证明该方向已经没有旧页面、缓存、Buffer Pin 和 DRC 响应，否则退休对应目录身份，禁止直接回绕复用。
 
 共页上的一个对象只属于一个顶点的一个方向。顶点描述符指向它的 Side Slot。对象以主人头开始，后面是一种或多种边的小列表：
 
@@ -1544,7 +1546,7 @@ typedef struct st_graph_adj_shard_entry {
 } graph_adj_shard_entry_t;           /* 32B */
 ```
 
-`lower_bound/upper_bound` 按Shard Policy解释为Hash、VID范围或时间桶边界。`graph_adj_shard_entry_t.flags` 在 V1 必须为 0。`route_epoch` 是这组分片边界的发布代次；重分布期间新边界使用新代次，查询不能把新旧边界混在一次扫描中。它不代替 `directory_version`：前者标识分片路由，后者标识目录页链是否仍属于已发布目录。
+`lower_bound/upper_bound` 按Shard Policy解释为Hash、VID范围或时间桶边界。`graph_adj_shard_entry_t.flags` 在 V1 必须为 0。`route_epoch` 是这一组分片边界的发布代次。一次扫描只用按 `switch_scn` 选中的那个根上的边界，不把旧根和新根的边界混在一起。`directory_version` 只用来确认页面属于这条被选中的链，不拿它和目录上最新的版本比较。
 
 迁移对象为：
 
@@ -1560,7 +1562,7 @@ typedef struct st_graph_adj_migration {
 } graph_adj_migration_t;             /* 32B */
 ```
 
-查询SCN早于 `switch_scn` 时走old root，晚于或等于它时走new root。未完成切换时允许双读，但必须按EID去重。`old_mode/new_mode` 使用顶点描述符中的邻接模式编号。`route_epoch` 标识这一次模式切换，`flags` 在 V1 必须为 0。可见性只由 `switch_scn` 决定。
+查询 SCN 早于 `switch_scn` 时只走 old root，晚于或等于它时只走 new root。选定一个根之后，只使用这个根上的分片边界和这个根的 `directory_version`。新链上尚未发布的复制页对其他事务不可见。已提交的查询不把两条链拼起来读；双读补不上还留在旧链、尚未复制到新链的边。恢复时如果同一 EID 同时出现在两条已经发布的链上，按 EID 去重，不能返回两次。`old_mode/new_mode` 使用顶点描述符中的邻接模式编号。`route_epoch` 标识这一次模式切换，`flags` 在 V1 必须为 0。可见性只由 `switch_scn` 决定。
 
 ### 10.4 形态切换
 
@@ -1580,7 +1582,7 @@ typedef struct st_graph_adj_migration {
 
 默认分片是 `HASH(neighbor_vid)`，`MIN_SHARDS=16`，每片目标 65536 条，`MAX_SHARDS=256`。第一期不因为删除而从 `EXTERNAL_DIRECTORY`、`SUPERNODE_SHARDED` 或 `DIRECT` 自动退回更低形态，避免度数在阈值附近来回切换。`PACKED_DIRECTORY` 在该方向已经没有可见边时回到 `NO_ADJACENCY`：同一事务把对象槽标为删除，Locator 置空，`edge_count_hint` 写 0。这不经过 Migration 对象。再插入仍从共页建立第一条边。
 
-`PACKED→EXTERNAL` 和之后进入 `SUPERNODE_SHARDED` 的切换，一律先写 Migration 对象和 `switch_scn`，再原子发布新的 Mode 与 Root。共页之间的换页只更新 Locator。
+`PACKED→EXTERNAL` 和之后进入 `SUPERNODE_SHARDED` 的切换，一律先写 Migration 对象和 `switch_scn`，再原子发布新的 Mode 与 Root。新链使用新的 `directory_version`，旧链的版本不改。`switch_scn` 提交之前，该方向的新边仍写旧根。查询按第 10.3 节用 SCN 选择一个根，并用这个根自己的 `directory_version` 校验沿途页面。超级节点的分批复制和尾部补齐见第 14 节。共页之间的换页只更新 Locator。
 
 ## 11. 邻接项与三类 Inline Properties
 
@@ -1699,7 +1701,7 @@ typedef struct st_graph_adj_data_page_header {
     uint32 live_count;
     uint32 flags;
     graph_adj_locator_t next_page;
-    uint32 directory_version;       /* 独占目录链等于已发布版本；DIRECT 写 0 */
+    uint32 directory_version;       /* 等于所属链根页的版本；DIRECT 和共页写 0 */
     uint16 free_begin;
     uint16 free_end;
     uint8  itl_count;
@@ -1718,7 +1720,7 @@ itl_count <= itl_capacity
 
 `slot_count` 是 Side Slot 高水位，读取时逐个扫描，不能用 `live_count` 提前停止。`live_count` 是可落后的可见项估计。`shard_id` 从 0 开始，未分片页面的 `shard_id=0` 且 `shard_count=1`。`flags` 在 V1 必须为 0；页面身份由 `owner_vid`、`direction`、`edge_type_id` 和 `shard_id` 校验。
 
-`next_page` 形成同一个 `(owner_vid, direction, edge_type_id, shard_id)` 的页面链。每次进入页面必须校验这些字段、Schema Layout 和 Page Generation。独占目录链上的页还要校验 `directory_version` 等于已发布版本。`DIRECT` 页的 `directory_version` 为 0，不做这个比较。
+`next_page` 形成同一个 `(owner_vid, direction, edge_type_id, shard_id)` 的页面链。每次进入页面必须校验这些字段、Schema Layout 和 Page Generation。从独占目录链进入的页，`directory_version` 必须等于本次选中的根页上的版本。`DIRECT` 页和共页的 `directory_version` 为 0，不做这个比较。
 
 Phase 1查询扫描页内可见Adjacency Entry及其Inline状态，不能依赖页面级范围或集合摘要跳页。Zone Map、Bloom Filter和 `invalid_projection_mask` 只有在基准测试证明收益后，才作为 `adj_data_format_version=2` 的追加字段引入；V2必须增加 `header_bytes` 并注册精确长度。已有V1页面通过后台整页重写升级，不能在原Header中原地扩展。启用V2前仍受集群兼容矩阵和全节点写入门禁约束。
 
@@ -1897,9 +1899,11 @@ Inline Edge Capacity = 0
 |---|---|---|
 | `owner_id` | `UINT64` | 顶点行存 VID，边行存 EID |
 | `owner_generation` | `UINT16` | 必须等于 `owner_id` 中的 generation |
-| `schema_layout_id` | `UINT16` | 写入时的布局版本，供双读 |
+| `schema_layout_id` | `UINT16` | 这一行写入时的布局；可以与槽的布局不同 |
 
-`08` 和 `22` 仍保存现有 8B `rowid_t`。没有属性行时写 `INVALID_ROWID`。读取使用现有 PCR Heap 接口，并沿用堆行迁移链。取回行之后比较 `owner_id`、`owner_generation` 和 `schema_layout_id`。任一不匹配都视为陈旧 RowID 或损坏，不能把该行返回给其他顶点或边。业务表的物理位置继续单独缓存，并用业务主键校验。
+`08` 和 `22` 仍保存现有 8B `rowid_t`。没有属性行时写 `INVALID_ROWID`。读取使用现有 PCR Heap 接口，并沿用堆行迁移链。取回行之后先比较身份：顶点行的 `owner_id` 必须等于槽的 VID，边行必须等于槽的 EID，`owner_generation` 必须等于该槽的 generation。这两个字段不匹配，视为陈旧 RowID 或损坏，不能把该行返回给其他顶点或边。
+
+`schema_layout_id` 不要求与槽相等。槽和属性行的布局都必须属于同一个顶点类型或同一个边类型，并且都不是 0。两者可以一个仍是旧布局、一个已经是该类型更新后的布局。第 18.2 节把新布局才有的值先写入属性行、规范槽暂时保持旧布局时，用的就是这种组合。读取时槽用槽的布局解码，属性行用行上的布局解码，不能拿槽的布局去解释属性行。布局属于其他类型时视为损坏。业务表的物理位置继续单独缓存，并用业务主键校验。
 
 这样 `ADD PROPERTY` 可以直接使用现有加列能力。图代码不需要教堆扫描器跳过私有前缀。
 
@@ -1915,19 +1919,17 @@ Inline Edge Capacity = 0
 
 默认按邻居 VID 哈希，使百万级邻接可并行扫描。时间窗口查询为主的边使用时间范围分片。
 
-升级过程：
+一个方向上的边不是一条溢出链。进入 `SUPERNODE_SHARDED` 之后，每个分片有自己的 `next_page` 邻接数据页链，分片之间靠 Shard Entry 并列。查询只打开这次选中的根上、边界覆盖目标的那些分片。
 
-```text
-创建分片目录
- → 新建多个邻接 Extent
- → 后台按策略重分布旧项
- → 新写入进入目标分片
- → 原子切换目录版本
- → 等待旧快照结束
- → 回收旧页
-```
+重分布不能让已经提交的边从旧快照中消失：
 
-分片分散到多个页面和 DRC bucket。超级节点不使用单链溢出页。
+1. 后台按 EID 分批把旧链上已经提交的边复制到新分片链。每一批是一个独立事务。新链使用新的 `directory_version`。此时顶点根仍指向旧结构，其他事务看不到新链。
+2. 复制期间新插入仍写旧结构，并随旧根对对应 SCN 可见。
+3. 切换事务先阻止该方向的新插入提交到旧结构，再把尚未复制的尾部在同一事务中复制到新链，然后写入 Migration 对象和 `switch_scn`，并发布新的 Mode 与 Root。被挡住的插入在发布之后只写新分片。
+4. 查询 SCN 早于 `switch_scn` 时只读旧根和旧分片边界；晚于或等于它时只读新根和新边界。一次扫描不混用两套边界，也不把尚未发布的复制页和旧链拼在一起。
+5. 旧快照、Undo、Buffer Pin 和 DRC 引用都结束后，再回收旧页。
+
+分片分散到多个页面和 DRC bucket。每一片内部仍是一条 `next_page` 链。
 
 ## 15. 多 Label
 
@@ -1954,6 +1956,8 @@ bit 31 = 1    外部 Label Set
 
 只要集合中有一个非常用 Label，低 31 位就不再是位图，而是外部集合编号。外部集合保存完整成员，包含其中的常用 Label。顶点同时拥有常用 `User` 和非常用 `Contractor` 时写成 `0x80000000 | set_id`，该 `set_id` 的成员是 `{User, Contractor}`。不能只把非常用 Label 放进外部集合，否则常用 Label 的判断会丢失。
 
+创建顶点的同一事务必须让这个字包含类型名。成员全是常用 Label 时，把类型名的常用位置 1。成员里有非常用 Label 时，外部集合的 `label_id` 列表必须包含类型名。可见顶点的 `label_set_id` 不能是 0，否则 `(u:User)` 匹配不到这个顶点。全 0 只出现在尚未初始化或已经删除、对当前 SCN 不可见的槽上。
+
 从已知 VID 判断一个或多个 Label 时只读取这一个 32 bit 字：
 
 ```text
@@ -1964,8 +1968,9 @@ bit31 = 0:
     多个常用 Label 一次做位图包含判断
 bit31 = 1:
     用 bits 0–30 查询 Dictionary Cache
-    Cache 保存该集合的完整成员位图
-    常用 Label 和非常用 Label 都在这张位图中判断
+    Cache 保存该集合的全部 label_id
+    常用 Label 和非常用 Label 都按 label_id 判断
+    非常用 Label 的 common_ordinal 是 255，没有可以测试的位
 ```
 
 Catalog：
@@ -1976,7 +1981,9 @@ SYS_GRAPH_LABEL_SET             /* 只保存无法放入内联位图的完整集
 SYS_GRAPH_LABEL_SET_MEMBER
 ```
 
-外部 `label_set_id` 按完整成员复用，集合内容不可变。编号 0 保留。已发布给顶点槽、Undo、快照或缓存的编号不得改指另一组成员；31 bit 编号耗尽时拒绝新的不同集合，禁止回绕。
+外部 `label_set_id` 按完整成员复用，集合内容不可变。编号 0 保留。查找已有集合时先用成员指纹找候选，指纹相同还要按 `label_id` 升序逐个比较成员；成员不同就新建集合，不能因为指纹碰撞复用另一组成员。已发布给顶点槽、Undo、快照或缓存的编号不得改指另一组成员；31 bit 编号耗尽时拒绝新的不同集合，禁止回绕。
+
+顶点改用新集合后，旧集合及其成员行仍然保留。没有任何可见顶点、Undo 或仍可能读到旧字的快照引用它时，才允许删除。缓存可以继续保留这份不可变内容。
 
 从 Label 扫描全图时仍使用按分区组织的倒排索引。内联位图只加速已知 VID 的判断，不代替倒排：
 
@@ -2000,7 +2007,7 @@ SYS_GRAPH_LABEL_SET_MEMBER
  → 02/04/05 User Vertex Slot
 ```
 
-读取 `06.label_set_id`。`User` 为常用 Label 且 bit31 为 0 时，直接测试它的 `common_ordinal`；bit31 为 1 时，用低 31 位读取外部集合的完整成员并确认包含 `User`。
+读取 `06.label_set_id`。可见顶点的这个字不能是 0。`User` 为常用 Label 且 bit31 为 0 时，直接测试它的 `common_ordinal`；bit31 为 1 时，用低 31 位读取外部集合的 `label_id` 列表并确认包含 `User`。
 
 ### 16.2 第一跳 CLICKED
 
@@ -2042,8 +2049,8 @@ SUPERNODE_SHARDED
 
 MIGRATING
  → 读取Migration对象
- → 按query_scn和switch_scn选择old/new root
- → 需要双读时按EID去重
+ → 按query_scn和switch_scn只选择old root或new root
+ → 只扫描这个根；恢复时同一EID出现两次才按EID去重
 ```
 
 进入每张Adjacency Page时必须校验：
@@ -2056,7 +2063,7 @@ schema_layout_id可读
 root locator generation匹配
 SHARED 页：页头 owner_vid 为 0，next_page 为空 Locator，对象主人等于当前顶点，directory_version 为 0
 独占页：页头 owner_vid 等于当前顶点
-独占目录链上的页：directory_version 等于当前已发布目录版本
+独占目录链上的页：directory_version 等于本次选中的根页上的版本
 DIRECT 或共页：directory_version 为 0，不做目录版本比较
 ```
 
@@ -2442,7 +2449,7 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `vertex_type_id` | `UINT32` | `TYPE` 行指向本类型；`LABEL` 行指向 `ON VERTEX TYPE` 的类型 |
 | `label_role` | `UINT8` | 1 `TYPE`，2 `LABEL` |
 | `common_ordinal` | `UINT8` | 0–30；255 表示非常用 |
-| `status` | `UINT8` | 1 `ACTIVE`，2 `RETIRED` |
+| `status` | `UINT8` | 1 `ACTIVE`，2 `HIDDEN`，3 `DROPPED`；与顶点类型相同，不用单独的 `RETIRED` |
 
 `SYS_GRAPH_PROPERTY` 的主键是 `(graph_id, property_id)`：
 
@@ -2483,7 +2490,7 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | `unit` | `UINT8` | 0 无，1 `SECOND`，2 `MILLISECOND`，3 `MICROSECOND` |
 | `overflow` | `UINT8` | 1 `REJECT`，2 `WARNING` |
 
-`SYS_GRAPH_LABEL_SET` 的主键是 `(graph_id, label_set_id)`。`label_set_id` 是 31 bit 非 0 编号。列还包括 `member_count UINT16` 和 `member_fingerprint UINT64`。指纹是按 `label_id` 升序拼接后的 `cm_hash_raw`，用来查找已有集合。
+`SYS_GRAPH_LABEL_SET` 的主键是 `(graph_id, label_set_id)`。`label_set_id` 是 31 bit 非 0 编号。列还包括 `member_count UINT16` 和 `member_fingerprint UINT64`。指纹是按 `label_id` 升序拼接后的 `cm_hash_raw`，只用来查找候选集合。指纹相同必须再按 `label_id` 升序比较全部成员，成员不同不能复用。
 
 `SYS_GRAPH_LABEL_SET_MEMBER` 的主键是 `(graph_id, label_set_id, label_id)`，没有其他列。
 
@@ -2525,15 +2532,15 @@ SWITCH    新布局成为默认写入格式
 GC        等待旧快照结束后回收
 ```
 
-Vertex Inline表达式只能在图级预算内变更，因此Vertex Slot宽度不变，可以在原Segment中按Layout版本双读和回填。超过图级预算的变更必须拒绝，用户需要重建图；第一期不提供改变 `VERTEX_INLINE_SIZE` 的在线迁移。
+Vertex Inline表达式只能在图级预算内变更，因此Vertex Slot宽度不变，可以在原Segment中按Layout版本双读和回填。回填过程中槽和属性行可以暂时使用该类型的不同布局，按第 13 节各自解码。超过图级预算的变更必须拒绝，用户需要重建图；第一期不提供改变 `VERTEX_INLINE_SIZE` 的在线迁移。
 
-Edge Inline表达式变更会创建新的 `schema_layout_id`。`EDGE_SLOT_PROFILE=AUTO` 对每个新Layout重新计算最小可用档位，因此新Layout可以比旧Layout更窄、同宽或更宽；显式Profile则继续使用用户指定的预算。新写入进入新Layout的Edge Page，旧边保留在旧Layout页面并继续按页头解码，不强制迁移且EID不变。更新旧边时，新Layout才有的值先写入Property Row；后台迁移Canonical Edge不属于第一期范围。
+Edge Inline表达式变更会创建新的 `schema_layout_id`。`EDGE_SLOT_PROFILE=AUTO` 对每个新Layout重新计算最小可用档位，因此新Layout可以比旧Layout更窄、同宽或更宽；显式Profile则继续使用用户指定的预算。新写入进入新Layout的Edge Page，旧边保留在旧Layout页面并继续按页头解码，不强制迁移且EID不变。更新旧边时，新Layout才有的值先写入Property Row，规范槽可以暂时保持旧布局。属性行和槽只要属于同一边类型，就按第 13 节各自解码，这个差异不是损坏。后台迁移Canonical Edge不属于第一期范围。
 
 改变 OUT 或 IN 的排序键也会创建新的 `schema_layout_id`，并按新顺序重写该方向的邻接项。第一期 DDL 不提供这个 `ALTER`。已有布局里的四个排序列不可修改。
 
 ### 18.3 删除和类型变更
 
-删除先把 `status` 改成 `HIDDEN`，等待旧查询结束后再物理清理。仍有可见顶点引用该类型、仍有可见边使用该边类型，或仍有顶点的 Label 位图、外部 Label Set 包含该 Label 时，删除顶点类型或 Label 失败。`DROP GRAPH` 在任一 Segment、属性表或索引仍存在时失败。第一期不在线清空非空图。
+删除先把顶点类型、边类型或 Label 的 `status` 改成 `HIDDEN`，等待旧查询结束后再物理清理，并把 `status` 改成 `DROPPED`。Label 使用这同一组状态，不另设 `RETIRED`。`DROPPED` 之后原来的 `common_ordinal` 仍然保留，不分配给新的 Label 或顶点类型。仍有可见顶点引用该类型、仍有可见边使用该边类型，或仍有顶点的 Label 位图、外部 Label Set 包含该 Label 时，删除顶点类型或 Label 失败。`DROP GRAPH` 在任一 Segment、属性表或索引仍存在时失败。第一期不在线清空非空图。
 
 安全扩展可以延迟转换，例如更窄整数扩展到更宽整数。不兼容转换要求显式转换表达式、后台校验和错误处理策略。
 
@@ -2770,15 +2777,16 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - 独占目录链只有 `next_page`，拆分和合并从已发布根扫描前驱；共页的 `next_page` 为空，空闲页走字节桶；旧引用退出前不回收页面；
 - `live_object_count` 为16 bit且不超过 `object_count`，回绕被拒绝；读取按 `object_count` 扫描全部Slot；
 - Directory页8 bit `flags` 的保留位为1时拒绝解析；
-- `directory_version` 在目录页和邻接数据页都固定为32 bit；16 bit回绕不得被当作当前目录，旧引用未退出时禁止复用；
+- `directory_version` 在目录页和邻接数据页都固定为32 bit；比较的是本次选中的根页版本，新链发布后旧链仍按自己的版本可读；16 bit回绕不得被当作当前目录，旧引用未退出时禁止复用；
 - DIRECT、PACKED、EXTERNAL、SHARDED和MIGRATING Root解析；
-- Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；
+- Packed对象晋升External Directory时旧快照读取旧Root、新快照读取新Root；`switch_scn` 提交前的新边仍在旧根上，提交后的查询不会漏掉这条边；
+- 超级节点重分布按 EID 分批复制；切换事务补齐尾部并发布 `switch_scn`；一次扫描只用一个根的分片边界；每个分片保留自己的 `next_page` 链；
 - Directory/Adjacency Side Slot整理不改变object_slot和generation；
 - OUT Entry保存dst VID、IN Entry保存src VID，并按对方VID跨分区分桶；
 - Directory计数和 `live_count` 陈旧时只能增加扫描、不能漏结果；
 - Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
-- Property Row通过系统列反向校验 Owner ID、generation 和 Schema Layout；
-- 多 Label 的 32 bit 复用：类型名自动占用常用序号，`CREATE LABEL ... COMMON` 才申请序号，255 表示非常用；外部集合保存完整成员、`common_ordinal` 不复用、`0x80000000` 拒绝；
+- Property Row的 `owner_id` 和 `owner_generation` 必须等于槽；同一类型的新旧 `schema_layout_id` 各自解码，其他类型的布局视为损坏；
+- 多 Label 的 32 bit 复用：类型名自动占用常用序号，创建顶点时字内必须包含类型名，可见顶点不能是 0；`CREATE LABEL ... COMMON` 才申请序号，255 表示非常用；外部集合按 `label_id` 保存完整成员，指纹碰撞要逐成员比较；旧集合在顶点、Undo 和快照都不再引用前不删除；`common_ordinal` 不复用、`0x80000000` 拒绝；Label 的 `HIDDEN`/`DROPPED` 与顶点类型相同；
 - `INLINE_TIME32`/`INLINE_TIME64` 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
@@ -2818,6 +2826,12 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | Directory Header按对齐空隙穿插字段 | 36B Header，删除 `directory_level` 和 `prev_page` | 第一期不是多层目录树；后继链从已发布根正向到达全部页面，减少拆分时要原子更新的链接 |
 | Directory `live_object_count` 使用32 bit、`flags` 使用16 bit | 两者分别缩为16 bit和8 bit | 32KB页面最多约1361个最小目录对象；页级标志只校验模式，未知保留位拒绝解析 |
 | `directory_version` 缩为16 bit | 目录页和邻接数据页都固定使用32 bit | 16 bit回绕会把旧目录页误认为当前目录，造成邻居重复、丢失或写入旧页面 |
+| 读目录时要求页面等于当前最新 `directory_version` | 期望版本取本次按 `switch_scn` 选中的根页 | 新链发布后，旧快照仍要沿旧版本读到旧邻居 |
+| 重分布尚未切换时，新边写入新分片 | 复制期间新边仍写旧根；切换事务补齐尾部并发布 `switch_scn` | 切换前的查询走旧根，提前写入新分片会丢边 |
+| 超级节点不使用溢出页链 | 每个分片有自己的 `next_page` 链，分片之间并列 | 一个方向的边不再是一条链，每一片内部仍然是 |
+| 属性行的 `schema_layout_id` 必须等于槽 | 身份列必须等于槽；同一类型的新旧布局各自解码 | 新布局的值可以先写入属性行，规范槽暂时保持旧布局 |
+| 外部 Label Set 用成员位图判断非常用 Label | Cache 保存 `label_id` 集合；创建顶点时字内包含类型名 | 非常用 Label 的序号是 255，没有位可以测试；全 0 的字匹配不到类型 |
+| Label 删除使用 `RETIRED` | Label 与顶点类型一样使用 `HIDDEN` 然后 `DROPPED` | 删除流程和 Catalog 枚举使用同一组状态；序号仍然不复用 |
 | 公共Identity统一管理所有页面布局版本 | 24B公共Identity只管理自身版本；每种Page Type Header独立管理格式版本和长度 | 解耦公共身份与Vertex、Edge、映射及邻接格式演进，同时支持追加字段和滚动升级门禁 |
 | 图单独指定 `PAGE_SIZE`，DDL 声明 `ZONEMAP` | 图使用数据库页大小；第一期邻接页不保存 Zone Map | Buffer、表空间和 Redo 只有一个页大小；页面级摘要已经推迟到 Format V2 |
 | 属性行私有 24B 图身份头 | 普通 PCR 堆表加 `owner_id`、`owner_generation`、`schema_layout_id` 系统列 | 复用行格式、加列、LOB 和迁移链，避免堆扫描把私有头当成用户列 |
@@ -2839,8 +2853,8 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. OUT/IN各使用相同的12B Descriptor但独立Mode；目录按Edge Type路由，并选择DIRECT、PACKED、EXTERNAL或SHARDED。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。OUT 和 IN 各自保存一个排序键。
-8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用保存完整成员的外部 Label Set。顶点类型名自动占用常用序号；可选身份用 `CREATE LABEL`，只有它使用 `COMMON`。ID Namespace 保持不变。
-9. 超级节点按邻居哈希等方式分片。
+8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用按 `label_id` 保存完整成员的外部 Label Set。可见顶点包含类型名。顶点类型名自动占用常用序号；可选身份用 `CREATE LABEL`，只有它使用 `COMMON`。ID Namespace 保持不变。
+9. 超级节点按邻居哈希等方式分片。每个分片有自己的页链。重分布在 `switch_scn` 发布前把新边留在旧根，发布时补齐尾部。
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
 12. 向量能力先预留 Frontier 接口，不进入第一期存储关键路径。
@@ -2849,7 +2863,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 15. Segment只使用Chunked Extent Map，超大或稀疏Segment可用Extent级Radix容器；坏页复用现有原位ABR，原位置永久不可写时使用存储层重映射或整Extent搬迁；所有Graph Page保存并反向校验公共身份。
 16. 固定Vertex/Edge Slot Page预留不可增长的ITL区域；Adjacency/Directory使用带generation和ITL的8B Side Slot。
 17. OUT Entry保存完整dst VID，IN Entry保存完整src VID；跨分区Frontier根据Entry中的VID分桶。
-18. Property Row复用普通PCR Heap表。系统列保存Owner ID、generation和Schema Layout，不插入私有24B行前缀。
+18. Property Row复用普通PCR Heap表。`owner_id` 和 generation 必须等于槽。同一类型的新旧 Schema Layout 各自解码，不插入私有24B行前缀。
 19. 公共Graph Page Identity固定24B V1兼容前缀；Segment、Extent Map、Vertex、Edge和两类Adjacency页面在各自Header中独立管理8-bit Format Version与Header长度。
 20. Phase 1 Adjacency Data Header为56B，只使用 `free_begin/free_end` 管理变长空间；Zone Map、Bloom Filter和页面级失效掩码延后到独立Format V2，并通过整页重写启用。
 
