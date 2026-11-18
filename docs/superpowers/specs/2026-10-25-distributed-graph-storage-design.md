@@ -59,7 +59,7 @@ Department
 (Advertisement)-[:SIMILAR]->(Advertisement)
 ```
 
-一个用户可以同时拥有 `User`、`Person`、`Employee`、`Manager` 等多个 Label。
+一个用户顶点的类型是 `User`。`Person`、`Employee`、`Manager` 是挂在这个类型上的 Label。查询里类型名和 Label 都写在冒号后面，所以一个用户可以同时匹配 `User`、`Person`、`Employee`、`Manager`。
 
 边属性过滤是核心路径，例如点击时间、权重、状态、相似分和有效期。完整 JSON、审计信息和向量本体属于冷属性。
 
@@ -1889,7 +1889,7 @@ Inline Edge Capacity = 0
 
 `23 Property Data Page` 复用 PCR Heap，不在行头和列值之间插入私有的 24B 图身份头。堆行已经有自己的 `row_head_t`、NULL 位图、变长列和 LOB Locator。再插入一层私有头会让普通堆扫描把这 24B 当成用户列，也重复保存堆行自己已经知道的行长。
 
-每个顶点类型、每个边类型各有一张普通 PCR 堆表，表号记在对应的类型 Catalog 中。冷属性、JSON、Tag 附加属性、审计信息和向量 ID 都是这张表的普通列。大对象继续用 LOB，向量本体仍在后续独立的 Vector Segment 中，图行只保存引用。
+每个顶点类型、每个边类型各有一张普通 PCR 堆表，表号记在对应的类型 Catalog 中。冷属性、JSON、Label 附加属性、审计信息和向量 ID 都是这张表的普通列。大对象继续用 LOB，向量本体仍在后续独立的 Vector Segment 中，图行只保存引用。
 
 身份校验做成系统列，而不是页格式：
 
@@ -1943,7 +1943,7 @@ bit 31 = 1    外部 Label Set
   0x80000000  非法
 ```
 
-一个图最多注册 31 个常用 Label。创建顶点类型或 `CREATE VERTEX TAG ... COMMON` 时分配 `common_ordinal`，序号写入 `SYS_GRAPH_LABEL` 后不可改变、不可复用。未标记 `COMMON` 的 Label 没有序号。31 个序号用完或退休后，新 Label 只能进入外部 Label Set。第一期不允许把已有 Label 在常用与非常用之间在线转换，因为这会改变所有顶点槽中这 32 bit 的含义。
+一个图最多注册 31 个常用 Label。`CREATE VERTEX TYPE` 把类型名注册为 `label_role = TYPE` 的 Label，并分配 0–30 的 `common_ordinal`。类型名不使用 `COMMON`；31 个序号用完后，创建顶点类型失败。`CREATE LABEL ... ON VERTEX TYPE ... COMMON` 把可选身份注册为 `label_role = LABEL`，并分配下一个序号。没有 `COMMON` 的 Label 把 `common_ordinal` 写成 255。序号写入 `SYS_GRAPH_LABEL` 后不可改变、不可复用。常用序号用完后，带 `COMMON` 的 Label 创建失败；不带 `COMMON` 的 Label 仍可创建。第一期不允许把已有 Label 在常用与非常用之间在线转换，因为这会改变所有顶点槽中这 32 bit 的含义。
 
 顶点当前的 Label 全部属于常用集合时，直接把对应位写入槽内，不创建 Label Set 行，判断时也不查 Dictionary Cache。例如 `User=0`、`Person=1`、`Employee=2`、`Manager=3`：
 
@@ -1959,7 +1959,7 @@ bit 31 = 1    外部 Label Set
 ```text
 word = label_set_id
 bit31 = 0:
-    Label 没有 common_ordinal → 不包含
+    common_ordinal 为 255 → 不包含
     否则测试 bits[common_ordinal]
     多个常用 Label 一次做位图包含判断
 bit31 = 1:
@@ -1971,7 +1971,7 @@ bit31 = 1:
 Catalog：
 
 ```text
-SYS_GRAPH_LABEL                 /* 含不可变 common_ordinal，NULL 表示非常用 */
+SYS_GRAPH_LABEL                 /* common_ordinal 为 0–30 或 255；255 表示非常用 */
 SYS_GRAPH_LABEL_SET             /* 只保存无法放入内联位图的完整集合 */
 SYS_GRAPH_LABEL_SET_MEMBER
 ```
@@ -1984,7 +1984,7 @@ SYS_GRAPH_LABEL_SET_MEMBER
 (graph_id, label_id, virtual_partition_id) → compressed VID list
 ```
 
-添加或删除 Tag 时在同一事务中计算新的完整集合，并更新顶点槽与倒排索引。新集合能放入常用位图时写回 bit31 为 0 的字；否则创建或复用外部 Label Set，再写回 `0x80000000 | set_id`。旧快照通过 CR 读取旧字。VID、分区和顶点页位置保持不变。Tag 附加属性默认进入 `24`，不改变图级固定槽宽。
+添加或删除 Label 时在同一事务中计算新的完整集合，并更新顶点槽与倒排索引。新集合能放入常用位图时写回 bit31 为 0 的字；否则创建或复用外部 Label Set，再写回 `0x80000000 | set_id`。旧快照通过 CR 读取旧字。VID、分区和顶点页位置保持不变。Label 附加属性默认进入所属顶点类型的属性行，不改变图级固定槽宽。类型名不能用 `REMOVE` 去掉。
 
 ## 16. 复杂查询的遍历流程
 
@@ -2212,29 +2212,31 @@ STORAGE (
 PARTITION BY HASH (tenant_id, external_id);
 ```
 
-DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。顶点类型名同时注册为 Label。广告图示例将 `User` 标为 `COMMON` 并取得序号 0，后续 Tag 再依次取得序号。
+DDL 根据图的 `VERTEX_INLINE_SIZE` 校验编码宽度，且 Inline 投影不超过 8 个；图级预算为0时不允许声明 Vertex Inline Properties。变长属性自动进入 `24`。Vertex/Edge 的两位状态使用Meta中已有的 `inline_property_state_bitmap`，不占用图级Inline预算。顶点类型名同时注册为 Label，并取得一个不可变的常用序号。广告图中的 `User` 取得序号 0。这条语法不写 `COMMON`。31 个常用序号用完后，`CREATE VERTEX TYPE` 失败。
 
 第一期不提供按 Vertex Type 配置的 `VERTEX INLINE ADJACENCY`，因为它会破坏同一图Vertex Slot宽度固定的约束。低度边放在多个顶点共用的 Packed 页上。
 
-### 17.3 Tag
+### 17.3 Label
 
 ```sql
-CREATE VERTEX TAG Person FOR TYPE User IN GRAPH ad_graph
+CREATE LABEL Person ON VERTEX TYPE User IN GRAPH ad_graph
 COMMON;
 
-CREATE VERTEX TAG Employee FOR TYPE User IN GRAPH ad_graph
+CREATE LABEL Employee ON VERTEX TYPE User IN GRAPH ad_graph
 COMMON (
     employee_no VARCHAR(32),
     department_id BIGINT
 );
 
-CREATE VERTEX TAG Manager FOR TYPE User IN GRAPH ad_graph
+CREATE LABEL Manager ON VERTEX TYPE User IN GRAPH ad_graph
 COMMON (
     management_level SMALLINT
 );
+
+CREATE LABEL Contractor ON VERTEX TYPE User IN GRAPH ad_graph;
 ```
 
-`COMMON` 为该 Tag 分配不可变的常用 Label 序号，使只包含这些 Label 的顶点把成员放进 `label_set_id` 的低 31 位。Tag 属性默认进入属性行。
+`CREATE VERTEX TYPE` 决定属性表、Inline 布局、分区键和 ID Namespace。`CREATE LABEL` 只注册可选身份，不建立第二种顶点模式。`COMMON` 为该 Label 分配不可变的常用序号，使只包含常用 Label 的顶点把成员放进 `label_set_id` 的低 31 位。没有 `COMMON` 时 `common_ordinal` 写 255；顶点一旦带上这种 Label，整字改为外部 Label Set。`Person`、`Employee`、`Manager` 依次取得序号 1、2、3。`Contractor` 是非常用 Label。Label 上声明的列写入该顶点类型的 `SYS_GRAPH_PROPERTY`，列名在类型内唯一，值放在该类型的属性行。查询仍写成 `(u:User:Employee)`。
 
 ```cypher
 MATCH (u:User {external_id: $id})
@@ -2437,8 +2439,8 @@ Catalog 使用现有系统表机制。ID Map 和 Label 倒排是 PCR B-tree，�
 | 列 | 类型 | 说明 |
 |---|---|---|
 | `name` | `VARCHAR(128)` | Label 名 |
-| `vertex_type_id` | `UINT32` | 所属顶点类型 |
-| `label_role` | `UINT8` | 1 `TYPE`，2 `TAG` |
+| `vertex_type_id` | `UINT32` | `TYPE` 行指向本类型；`LABEL` 行指向 `ON VERTEX TYPE` 的类型 |
+| `label_role` | `UINT8` | 1 `TYPE`，2 `LABEL` |
 | `common_ordinal` | `UINT8` | 0–30；255 表示非常用 |
 | `status` | `UINT8` | 1 `ACTIVE`，2 `RETIRED` |
 
@@ -2531,7 +2533,7 @@ Edge Inline表达式变更会创建新的 `schema_layout_id`。`EDGE_SLOT_PROFIL
 
 ### 18.3 删除和类型变更
 
-删除先把 `status` 改成 `HIDDEN`，等待旧查询结束后再物理清理。仍有可见顶点引用该类型、仍有可见边使用该边类型，或仍有顶点的 Label 位图、外部 Label Set 包含该 Label 时，删除类型或 Tag 失败。`DROP GRAPH` 在任一 Segment、属性表或索引仍存在时失败。第一期不在线清空非空图。
+删除先把 `status` 改成 `HIDDEN`，等待旧查询结束后再物理清理。仍有可见顶点引用该类型、仍有可见边使用该边类型，或仍有顶点的 Label 位图、外部 Label Set 包含该 Label 时，删除顶点类型或 Label 失败。`DROP GRAPH` 在任一 Segment、属性表或索引仍存在时失败。第一期不在线清空非空图。
 
 安全扩展可以延迟转换，例如更窄整数扩展到更宽整数。不兼容转换要求显式转换表达式、后台校验和错误处理策略。
 
@@ -2776,7 +2778,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 - Directory计数和 `live_count` 陈旧时只能增加扫描、不能漏结果；
 - Phase 1 Adjacency Data Header为56B，不包含Zone Map、Bloom或页面级失效掩码；V2摘要只能通过新Format Version和整页重写启用；
 - Property Row通过系统列反向校验 Owner ID、generation 和 Schema Layout；
-- 多 Label 的 32 bit 复用：常用 Label 内联位图、外部集合保存完整成员、`common_ordinal` 不复用、`0x80000000` 拒绝；
+- 多 Label 的 32 bit 复用：类型名自动占用常用序号，`CREATE LABEL ... COMMON` 才申请序号，255 表示非常用；外部集合保存完整成员、`common_ordinal` 不复用、`0x80000000` 拒绝；
 - `INLINE_TIME32`/`INLINE_TIME64` 的边界、时区、单位和不可变 Base；
 - 所有 INLINE 数字目标类型的现有 CAST 语义、REJECT 原子回滚和两位状态转换；
 - `00` NULL、`01` 有效 Inline、`10` 规范值回读三种状态的读写；
@@ -2803,6 +2805,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 | 每个顶点独立 Directory Page | 低度顶点共用 Packed 页；对象变大后才进入独占目录、邻接数据页或分片 | 低度顶点避免每人一页，超级节点仍可独立分片 |
 | 图分区绑定一个 DRC 分区 | 两类分区正交 | DRC Master 可分散，本地性由 Page Owner 保证 |
 | 单 Label | 32 bit `label_set_id` 复用为常用 Label 位图，放不下时使用外部 Label Set | 常见角色组合直接在顶点槽判断，同时支持任意 Label 组合 |
+| 顶点类型和可选身份都叫 Tag 或都用接近的 CREATE 语法 | 类型用 `CREATE VERTEX TYPE`，可选身份用 `CREATE LABEL` | 类型决定存储模式并自动占用常用序号；只有 Label 使用 `COMMON`，非常用写 255 |
 | ID Map 按 Label | ID Map 按 ID Namespace | Label 可变，业务身份不变 |
 | 业务 ID 直接乘槽宽定位 | External ID 映射到 VID | 业务 ID 稀疏且需要稳定代次 |
 | `UINT32_DELTA`、`FIXED32_2` 等专用 Codec | `INLINE_TIME32`/`INLINE_TIME64` 和通用扩展 CAST | 复用 SQL 转换语义，避免大量专用编码 |
@@ -2836,7 +2839,7 @@ ID构造函数返回 `status_t`，在写入输出参数前校验generation非0�
 5. 每条边有唯一Canonical Edge Slot；Edge Page内槽宽固定，不同Layout可使用40B、48B、56B或64B。
 6. OUT/IN各使用相同的12B Descriptor但独立Mode；目录按Edge Type路由，并选择DIRECT、PACKED、EXTERNAL或SHARDED。
 7. 用户通过 EDGE、OUT、IN INLINE PROPERTIES 控制三处属性副本。OUT 和 IN 各自保存一个排序键。
-8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用保存完整成员的外部 Label Set；ID Namespace 保持不变。
+8. 多 Label 复用 32 bit `label_set_id`：常用 Label 使用内联位图，其余组合使用保存完整成员的外部 Label Set。顶点类型名自动占用常用序号；可选身份用 `CREATE LABEL`，只有它使用 `COMMON`。ID Namespace 保持不变。
 9. 超级节点按邻居哈希等方式分片。
 10. 第一期单写多读，多写通过分区亲和扩展。
 11. 分区键变更默认重建；Placement 和 Preferred Instance 可在线调整。
